@@ -1,0 +1,94 @@
+name: Console helper native checks
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - 'src/platform/windows/display_session_bridge/**'
+      - 'tools/display_session_helper.cpp'
+      - 'src/display_device/state_retry_timer.h'
+      - 'tests/display_session_bridge/**'
+      - '.github/workflows/console-helper-native.yml'
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [msvc, ucrt64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        if: matrix.compiler == 'ucrt64'
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+      - name: MSVC configure build test
+        if: matrix.compiler == 'msvc'
+        shell: pwsh
+        run: |
+          cmake -S tests/display_session_bridge -B helper-checks -A x64
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build helper-checks --config Debug --parallel 2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ctest --test-dir helper-checks -C Debug --output-on-failure
+          exit $LASTEXITCODE
+      - name: UCRT64 configure build test
+        if: matrix.compiler == 'ucrt64'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cmake -S tests/display_session_bridge -B helper-checks -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          cmake --build helper-checks --parallel 2
+          ctest --test-dir helper-checks --output-on-failure
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: console-helper-native-${{ matrix.compiler }}
+          path: |
+            helper-checks/Testing/Temporary/*.log
+            helper-checks/CMakeFiles/CMakeConfigureLog.yaml
+            helper-checks/**/*.exe
+            helper-checks/*.exe
+            src/platform/windows/display_session_bridge
+            tests/display_session_bridge
+            src/display_device/state_retry_timer.h
+            tools/display_session_helper.cpp
+          retention-days: 7
+  upstream_adapter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Inspect pinned upstream adapter without running it
+        shell: python
+        run: |
+          import hashlib, json, pathlib, re, urllib.request, zipfile
+          url='https://github.com/AlkaidLab/foundation-sunshine/releases/download/v2026.911.85650.%E6%9D%82%E9%B1%BC/Sunshine.v2026.0911.Portable-x64.zip'
+          archive=pathlib.Path('upstream.zip')
+          urllib.request.urlretrieve(url,archive)
+          expected='1da04ac3a114199018f39636ed3a386b3ab57f59968400856bf582fca1425743'
+          assert hashlib.sha256(archive.read_bytes()).hexdigest()==expected, 'Upstream archive digest mismatch'
+          out=pathlib.Path('upstream-rtx'); out.mkdir()
+          manifest={'archive_sha256':expected,'files':{}}
+          with zipfile.ZipFile(archive) as z:
+              for name in z.namelist():
+                  base=pathlib.PurePosixPath(name).name
+                  if base in ('sunshine.exe','foundation_rtx_video_adapter.dll'):
+                      data=z.read(name); (out/base).write_bytes(data)
+                      manifest['files'][base]=hashlib.sha256(data).hexdigest()
+                      if base=='sunshine.exe':
+                          strings=[]
+                          for m in re.finditer(rb'(?<![a-f0-9])[a-f0-9]{64}(?![a-f0-9])',data):
+                              strings.append({'offset':m.start(),'digest':m.group().decode(),'context':repr(data[max(0,m.start()-80):m.end()+80])})
+                          manifest['embedded_hashes']=strings
+          (out/'upstream-analysis.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+          assert 'foundation_rtx_video_adapter.dll' in manifest['files'], 'Pinned official adapter missing'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: upstream-rtx-analysis
+          path: upstream-rtx
+          retention-days: 7
