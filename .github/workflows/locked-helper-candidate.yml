@@ -1,0 +1,112 @@
+name: Locked console candidate validation
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: ['port/locked-helper/**', '.github/workflows/locked-helper-candidate.yml']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: console-helper-native-ucrt64
+          run-id: 34656109437
+          github-token: ${{ github.token }}
+          path: native
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+      - name: Overlay exact candidate and reuse the failing validation probe
+        shell: python
+        run: |
+          import hashlib,json,pathlib,urllib.request,zipfile,os
+          root=pathlib.Path('native'); out=pathlib.Path('evidence');out.mkdir()
+          files={
+            'session_context.h':('src/platform/windows/display_session_bridge/session_context.h','8566ef0ff3fb1b8fee8113e41571fef091bd568c1709e360f1802d80d9a4d7ae'),
+            'client.cpp':('src/platform/windows/display_session_bridge/client.cpp','09b8b33f13877dd1da14c082b8e59787ba37a1362c1bb65a91fa544910d1e6ee'),
+            'display_session_helper.cpp':('tools/display_session_helper.cpp','d5ae4517118a1ffc3be416397fc6a5ce6fa6c86a5da56cf94498ca9c5598e41d')}
+          manifest={}
+          for name,(target,expected) in files.items():
+            data=(pathlib.Path('port/locked-helper')/name).read_bytes().replace(b'\r\n',b'\n')
+            actual=hashlib.sha256(data).hexdigest()
+            assert actual==expected,(name,actual)
+            (root/target).write_bytes(data);manifest[target]=actual
+          (out/'source.json').write_text(json.dumps({'commit':os.environ['GITHUB_SHA'],'files':manifest},indent=2))
+          # Download only the earlier test source artifact, not executable third-party code.
+          req=urllib.request.Request('https://api.github.com/repos/rui12366B/foundation-sunshine/actions/artifacts/10286253104/zip',headers={'Authorization':'Bearer '+os.environ['GH_TOKEN']})
+          with urllib.request.urlopen(req) as response: blob=response.read()
+          pathlib.Path('prior-evidence.zip').write_bytes(blob)
+          assert hashlib.sha256(blob).hexdigest()=='544368f6f51b37442cd13b63ca995c51e8ee77ee8267829c7538a16adbd254b4'
+          with zipfile.ZipFile('prior-evidence.zip') as z:
+            names=[name for name in z.namelist() if name.endswith('/probe_windows.cpp')]
+            assert len(names)==1
+            source=z.read(names[0]);(root/'tests/display_session_bridge/probe_windows.cpp').write_bytes(source)
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Compile candidate and run native component tests
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cmake -S native/tests/display_session_bridge -B native/check -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build native/check --parallel 2
+          ctest --test-dir native/check --output-on-failure
+      - name: Test normal and locked console without changing display topology
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $env:GITHUB_WORKSPACE 'evidence'
+          $probe=Join-Path $env:GITHUB_WORKSPACE 'native\check\bridge_probe.exe'
+          $results=@()
+          foreach($phase in @('normal','locked')) {
+            if($phase -eq 'locked') {
+              $env:PATH='C:\msys64\ucrt64\bin;'+$env:PATH
+              & $probe --lock-isolated-runner *> "$root\lock-request.txt"
+              if($LASTEXITCODE) {throw 'This isolated CI worker did not enter the requested lock state'}
+            }
+            $script=Join-Path $root "run-$phase.ps1"
+            $qroot=$root.Replace("'","''");$qprobe=$probe.Replace("'","''")
+            @"
+          `$env:PATH='C:\msys64\ucrt64\bin;'+`$env:PATH
+          & '$qprobe' --$phase *> '$qroot\probe-$phase.txt'
+          [System.IO.File]::WriteAllText('$qroot\exit-$phase.txt',[string]`$LASTEXITCODE)
+          "@ | Set-Content $script -Encoding utf8
+            $task='FoundationCandidate-'+[guid]::NewGuid().ToString('N')
+            try {
+              $a=New-ScheduledTaskAction -Execute powershell.exe -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "'+$script+'"')
+              $p=New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
+              $s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
+              Register-ScheduledTask -TaskName $task -Action $a -Principal $p -Settings $s | Out-Null
+              Start-ScheduledTask $task
+              $deadline=(Get-Date).AddSeconds(65)
+              while(!(Test-Path "$root\exit-$phase.txt") -and (Get-Date) -lt $deadline) {Start-Sleep -Milliseconds 500}
+              if(!(Test-Path "$root\exit-$phase.txt")) {throw 'Candidate SYSTEM test timed out'}
+              $code=(Get-Content "$root\exit-$phase.txt" -Raw).Trim()
+              $text=Get-Content "$root\probe-$phase.txt" -Raw
+              Write-Host $text
+              $passed=$code -eq '0' -and $text.Contains('iteration=3 validate=0')
+              if($phase -eq 'locked') {$passed=$passed -and $text.Contains('context=SYSTEM-locked-console') -and $text.Contains('lock=0')}
+              $results+=@{phase=$phase;exit_code=$code;passed=$passed}
+              @{source_commit=$env:GITHUB_SHA;scope='Isolated Windows console query/get-info/SDC_VALIDATE and helper restart; not RDP/Zako or actual modesetting';results=$results} | ConvertTo-Json -Depth 6 | Set-Content "$root\results.json"
+              if(!$passed) {throw "Candidate $phase validation failed"}
+            } finally {
+              Stop-ScheduledTask $task -ErrorAction SilentlyContinue
+              Unregister-ScheduledTask $task -Confirm:$false -ErrorAction SilentlyContinue
+            }
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: locked-helper-candidate-evidence
+          path: |
+            evidence
+            native/check/Testing/Temporary/*.log
+            native/check/CMakeFiles/CMakeConfigureLog.yaml
+          retention-days: 7
