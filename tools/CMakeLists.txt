@@ -106,3 +106,15 @@ if(WIN32)
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
             COMMENT "Checking Sunshine/VDD IOCTL ABI header sync; set VDD_DRIVER_HEADER when DriverHeader is not passed")
 endif()
+
+# Experimental console-scoped CCD helper. A matching helper is mandatory when
+# display_session_helper is enabled; it is not a driver or a tscon wrapper.
+add_executable(foundation_display_helper
+        display_session_helper.cpp
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/display_session_bridge/dispatch.cpp")
+set_target_properties(foundation_display_helper PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
+target_compile_definitions(foundation_display_helper PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00)
+target_link_libraries(foundation_display_helper PRIVATE user32 advapi32 wtsapi32)
+if(MINGW)
+    target_link_options(foundation_display_helper PRIVATE -municode)
+endif()

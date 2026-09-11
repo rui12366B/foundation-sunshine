@@ -16,6 +16,12 @@ if (_rtx_mode STREQUAL "OFF" OR NOT WIN32)
     return()
 endif ()
 
+# Optional exact-release first-party adapter, with unchanged runtime verification.
+if (SUNSHINE_PINNED_RELEASE_ADAPTER_DIR)
+    include("${CMAKE_CURRENT_LIST_DIR}/PinnedOfficialRtxAdapter.cmake")
+    return()
+endif ()
+
 include("${CMAKE_CURRENT_LIST_DIR}/FetchRtxVideoSdk.cmake")
 sunshine_find_rtx_video_sdk(_rtx_sdk_root _rtx_reason)
 unset(_SUNSHINE_RTX_VIDEO_SDK_TOKEN)

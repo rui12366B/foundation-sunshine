@@ -158,6 +158,8 @@ else()
 endif()
 
 set(PLATFORM_TARGET_FILES
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/display_session_bridge/client.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/display_session_bridge/client.h"
         "${CMAKE_CURRENT_BINARY_DIR}/windows.rc"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/publish.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/ftime_compat.cpp"
@@ -233,6 +235,8 @@ set(OPENSSL_LIBRARIES
 list(PREPEND PLATFORM_LIBRARIES
         ${CURL_STATIC_LIBRARIES}
         advapi32
+        bcrypt
+        user32
         avrt
         crypt32
         d3d11

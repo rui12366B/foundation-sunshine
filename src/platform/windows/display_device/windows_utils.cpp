@@ -1,3 +1,4 @@
+#include "src/platform/windows/display_session_bridge/client.h"
 // lib includes
 #include <boost/algorithm/string.hpp>
 #include <boost/uuid/name_generator_sha1.hpp>
@@ -108,7 +109,7 @@ namespace display_device::w_utils {
       scale_get.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE;
       scale_get.header.size = sizeof(scale_get);
 
-      const LONG result { DisplayConfigGetDeviceInfo(&scale_get.header) };
+      const LONG result { display_session_bridge::get_device_info(&scale_get.header) };
       if (result != ERROR_SUCCESS) {
         BOOST_LOG(debug) << get_error_string(result) << " failed to get display DPI scale for " << info.display_name;
         info.scale_set_supported = false;
@@ -158,7 +159,7 @@ namespace display_device::w_utils {
       target_name.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
       target_name.header.size = sizeof(target_name);
 
-      LONG result { DisplayConfigGetDeviceInfo(&target_name.header) };
+      LONG result { display_session_bridge::get_device_info(&target_name.header) };
       if (result != ERROR_SUCCESS) {
         BOOST_LOG(error) << get_error_string(result) << " failed to get target device name!";
         return {};
@@ -539,7 +540,7 @@ namespace display_device::w_utils {
     target_name.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
     target_name.header.size = sizeof(target_name);
 
-    if (LONG result = DisplayConfigGetDeviceInfo(&target_name.header); result != ERROR_SUCCESS) {
+    if (LONG result = display_session_bridge::get_device_info(&target_name.header); result != ERROR_SUCCESS) {
       BOOST_LOG(error) << get_error_string(result) << " failed to get target device name!";
       return {};
     }
@@ -566,7 +567,7 @@ namespace display_device::w_utils {
     source_name.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
     source_name.header.size = sizeof(source_name);
 
-    LONG result { DisplayConfigGetDeviceInfo(&source_name.header) };
+    LONG result { display_session_bridge::get_device_info(&source_name.header) };
     if (result != ERROR_SUCCESS) {
       BOOST_LOG(error) << get_error_string(result) << " failed to get display name! ";
       return {};
@@ -588,7 +589,7 @@ namespace display_device::w_utils {
     color_info.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
     color_info.header.size = sizeof(color_info);
 
-    LONG result { DisplayConfigGetDeviceInfo(&color_info.header) };
+    LONG result { display_session_bridge::get_device_info(&color_info.header) };
     if (result != ERROR_SUCCESS) {
       BOOST_LOG(error) << get_error_string(result) << " failed to get advanced color info! ";
       return hdr_state_e::unknown;
@@ -607,7 +608,7 @@ namespace display_device::w_utils {
 
     color_state.enableAdvancedColor = enable ? 1 : 0;
 
-    LONG result { DisplayConfigSetDeviceInfo(&color_state.header) };
+    LONG result { display_session_bridge::set_device_info(&color_state.header) };
     if (result != ERROR_SUCCESS) {
       BOOST_LOG(error) << get_error_string(result) << " failed to set advanced color info!";
       return false;
@@ -780,7 +781,7 @@ namespace display_device::w_utils {
         UINT32 path_count { 0 };
         UINT32 mode_count { 0 };
 
-        result = GetDisplayConfigBufferSizes(flags, &path_count, &mode_count);
+        result = display_session_bridge::get_buffer_sizes(flags, &path_count, &mode_count);
         if (result != ERROR_SUCCESS) {
           BOOST_LOG(virtual_mode_aware ? warning : error)
             << get_error_string(result) << " GetDisplayConfigBufferSizes failed"
@@ -796,7 +797,7 @@ namespace display_device::w_utils {
 
         paths.resize(path_count);
         modes.resize(mode_count);
-        result = QueryDisplayConfig(flags, &path_count, paths.data(), &mode_count, modes.data(), nullptr);
+        result = display_session_bridge::query_config(flags, &path_count, paths.data(), &mode_count, modes.data(), nullptr);
 
         // The function may have returned fewer paths/modes than estimated
         paths.resize(path_count);
@@ -920,7 +921,7 @@ namespace display_device::w_utils {
     scale_set.header.size = sizeof(scale_set);
     scale_set.scale_rel = static_cast<std::int32_t>(std::distance(std::begin(DISPLAY_SCALE_PERCENT_VALUES), scale_it) - details->recommended_scale_index);
 
-    const LONG set_result { DisplayConfigSetDeviceInfo(&scale_set.header) };
+    const LONG set_result { display_session_bridge::set_device_info(&scale_set.header) };
     if (set_result != ERROR_SUCCESS) {
       BOOST_LOG(error) << get_error_string(set_result) << " failed to set display DPI scale for " << result.display_name << " to " << scale_percent;
       result.error = set_result == ERROR_ACCESS_DENIED ? display_scale_error_e::permission_denied : display_scale_error_e::apply_failed;
@@ -1016,14 +1017,16 @@ namespace display_device::w_utils {
       return true;
     }
 
-    // Here we are supplying the retrieved display data back to SetDisplayConfig (with VALIDATE flag only, so that we make no actual changes).
+    // Here we are supplying the retrieved display data back to display_session_bridge::set_config (with VALIDATE flag only, so that we make no actual changes).
     // Unless something is really broken on Windows, this call should never fail under normal circumstances - the configuration is 100% correct, since it was
     // provided by Windows.
     const UINT32 flags { SDC_VALIDATE | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_VIRTUAL_MODE_AWARE };
-    const LONG result { SetDisplayConfig(display_data->paths.size(), display_data->paths.data(), display_data->modes.size(), display_data->modes.data(), flags) };
+    const LONG result { display_session_bridge::set_config(display_data->paths.size(), display_data->paths.data(), display_data->modes.size(), display_data->modes.data(), flags) };
 
     BOOST_LOG(debug) << "test_no_access_to_ccd_api result: " << get_error_string(result);
-    return result == ERROR_ACCESS_DENIED;
+    // With the helper, query/validate failure must never be interpreted as
+    // permission to apply a topology in a different or unavailable desktop.
+    return display_session_bridge::enabled() ? result != ERROR_SUCCESS : result == ERROR_ACCESS_DENIED;
   }
 
   bool

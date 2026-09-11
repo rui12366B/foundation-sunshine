@@ -31,3 +31,6 @@ if(NPM AND CARGO AND POWERSHELL_EXECUTABLE)
 else()
   message(STATUS "npm/cargo/PowerShell not found — sunshine-control-panel target disabled (GUI will be fetched from release)")
 endif()
+
+# Building sunshine alone must also produce its required opt-in CCD helper.
+add_dependencies(sunshine foundation_display_helper)

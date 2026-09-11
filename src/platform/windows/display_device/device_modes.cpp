@@ -1,3 +1,4 @@
+#include "src/platform/windows/display_session_bridge/client.h"
 // local includes
 #include "src/logging.h"
 #include "windows_utils.h"
@@ -189,7 +190,7 @@ namespace display_device {
         flags |= SDC_ALLOW_CHANGES;
       }
 
-      const LONG result { SetDisplayConfig(display_data->paths.size(), display_data->paths.data(), display_data->modes.size(), display_data->modes.data(), flags) };
+      const LONG result { display_session_bridge::set_config(display_data->paths.size(), display_data->paths.data(), display_data->modes.size(), display_data->modes.data(), flags) };
       if (result != ERROR_SUCCESS) {
         BOOST_LOG(error) << w_utils::get_error_string(result) << " failed to set display mode!";
         return false;

@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 
 // standard includes
 #include <mutex>
@@ -72,6 +73,7 @@ namespace display_device {
       enum class result_e {
         success,
         deferred_retry,
+        console_access_unavailable,
         vdd_not_installed,
         vdd_unavailable,
         vdd_create_failed,
@@ -288,6 +290,7 @@ namespace display_device {
     boost::optional<parsed_config_t::vdd_prep_e> current_vdd_prep; /**< Current VDD preparation mode for VDD mode sessions. */
     boost::optional<bool> current_use_vdd; /**< Whether current session is using VDD mode. */
     pending_vdd_context_t pending_vdd_; /**< 在显示配置成功或清理前保留的 VDD 创建基线。 */
+    std::uint64_t display_request_generation_ = 0; /**< Protected by mutex; stale queued callbacks cannot modify new sessions. */
     bool pending_restore_ = false; /**< Flag indicating if there is a pending restore settings operation waiting for unlock. */
     boost::atomic<int> polling_retry_count_ {0}; /**< Retry counter for polling restore mechanism. */
 

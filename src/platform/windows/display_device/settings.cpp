@@ -1,3 +1,4 @@
+#include "src/platform/windows/display_session_bridge/client.h"
 // standard includes
 #include <algorithm>
 #include <chrono>
@@ -921,7 +922,7 @@ namespace display_device {
     
     // 如果会话已锁定，直接返回true，跳过CCD API测试
     // 这避免了在锁屏状态下频繁调用显示API导致ERROR_ACCESS_DENIED和WATCHDOG事件
-    if (session_locked) {
+    if (session_locked && !display_session_bridge::enabled()) {
       BOOST_LOG(info) << "Changing settings will fail - session_locked: true";
       return true;
     }

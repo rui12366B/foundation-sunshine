@@ -38,6 +38,8 @@ namespace config {
     bool nv_realtime_hags;
     bool nv_opengl_vulkan_on_dxgi;
     bool nv_sunshine_high_power_mode;
+    /** Experimental console-scoped CCD helper. Test build default ON; requires SYSTEM service. */
+    bool display_session_helper;
     bool vdd_keep_enabled;
     /** When true, after stream end if no display is found (headless), create Zako VDD automatically. Default false. */
     bool vdd_headless_create_enabled;

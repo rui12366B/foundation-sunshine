@@ -57,6 +57,7 @@ add_custom_target(innosetup
     COMMAND ${CMAKE_COMMAND} -E echo "Stripping debug symbols from executables..."
     COMMAND strip --strip-debug "${CMAKE_BINARY_DIR}/inno_staging/sunshine.exe"
     COMMAND strip --strip-debug "${CMAKE_BINARY_DIR}/inno_staging/tools/sunshinesvc.exe"
+    COMMAND strip --strip-debug "${CMAKE_BINARY_DIR}/inno_staging/tools/foundation_display_helper.exe"
     COMMAND strip --strip-debug "${CMAKE_BINARY_DIR}/inno_staging/tools/dxgi-info.exe"
     COMMAND strip --strip-debug "${CMAKE_BINARY_DIR}/inno_staging/tools/audio-info.exe"
     

@@ -302,6 +302,7 @@ file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS
 # Standalone diagnostic programs under tests/tools have their own targets and
 # must not be linked into the aggregate GoogleTest executable.
 list(FILTER TEST_SOURCES EXCLUDE REGEX "/tests/tools/")
+list(FILTER TEST_SOURCES EXCLUDE REGEX "/tests/display_session_bridge/")
 # The touchscreen device test has a dedicated target that links the device
 # implementation; do not compile a second copy into the aggregate suite.
 list(FILTER TEST_SOURCES EXCLUDE REGEX "test_virtual_touchscreen_device\.cpp")

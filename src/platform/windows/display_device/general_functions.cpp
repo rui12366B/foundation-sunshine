@@ -1,3 +1,4 @@
+#include "src/platform/windows/display_session_bridge/client.h"
 // standard includes
 #include <unordered_set>
 
@@ -186,7 +187,7 @@ namespace display_device {
     }
 
     const UINT32 flags { SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | SDC_VIRTUAL_MODE_AWARE };
-    const LONG result { SetDisplayConfig(display_data->paths.size(), display_data->paths.data(), display_data->modes.size(), display_data->modes.data(), flags) };
+    const LONG result { display_session_bridge::set_config(display_data->paths.size(), display_data->paths.data(), display_data->modes.size(), display_data->modes.data(), flags) };
     if (result != ERROR_SUCCESS) {
       BOOST_LOG(error) << w_utils::get_error_string(result) << " failed to set primary mode for " << device_id << "!";
       return false;

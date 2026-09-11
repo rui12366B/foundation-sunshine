@@ -107,8 +107,24 @@ function(_rtx_sdk_asset_from_metadata metadata expected_url asset_id digest reas
     set(${reason} "the configured SDK asset was not found" PARENT_SCOPE)
 endfunction()
 
+# Explicit local SDK support for private/user builds. The SDK is not copied into
+# the source package; the existing adapter fingerprinting and runtime checks stay
+# unchanged. An invalid explicit path is an error, not a download fallback.
+set(NVIDIA_RTX_VIDEO_SDK_DIR "" CACHE PATH "Locally supplied, authorized NVIDIA RTX Video SDK root")
+
 function(sunshine_find_rtx_video_sdk output reason)
     set(${output} "" PARENT_SCOPE)
+    if (NVIDIA_RTX_VIDEO_SDK_DIR)
+        get_filename_component(_local_sdk "${NVIDIA_RTX_VIDEO_SDK_DIR}" ABSOLUTE)
+        _rtx_sdk_valid("${_local_sdk}" _local_valid)
+        if (_local_valid)
+            set(${output} "${_local_sdk}" PARENT_SCOPE)
+            set(${reason} "explicit local SDK" PARENT_SCOPE)
+        else ()
+            set(${reason} "the explicit NVIDIA_RTX_VIDEO_SDK_DIR is missing required headers/library/runtime" PARENT_SCOPE)
+        endif ()
+        return()
+    endif ()
     set(${reason} "private SDK download configuration is unavailable" PARENT_SCOPE)
     set(_url "${RTX_VIDEO_SDK_URL}")
     if (NOT _url)

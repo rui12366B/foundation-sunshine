@@ -410,6 +410,7 @@ namespace config {
     true,  // nv_realtime_hags
     true,  // nv_opengl_vulkan_on_dxgi
     true,  // nv_sunshine_high_power_mode
+    true,  // display_session_helper (test build default; configurable)
     false,  // vdd_keep_enabled
     false,  // vdd_headless_create_enabled
     false,  // vdd_reuse (default: recreate VDD for each client)
@@ -1407,6 +1408,7 @@ namespace config {
     }
     bool_f(vars, "wgc_disable_secure_desktop", video.wgc_disable_secure_desktop);
     bool_f(vars, "dynamic_resolution_follow_display", video.dynamic_resolution_follow_display);
+    bool_f(vars, "display_session_helper", video.display_session_helper);
     bool_f(vars, "vdd_keep_enabled", video.vdd_keep_enabled);
     bool_f(vars, "vdd_headless_create", video.vdd_headless_create_enabled);
     bool_f(vars, "vdd_reuse", video.vdd_reuse);
@@ -1935,6 +1937,7 @@ namespace config {
 
       // 受保护的字段：由系统托盘控制，需要保留本地配置文件中的原有值
       const std::set<std::string> protectedFields = {
+        "display_session_helper", // Experimental: edit config on disk with service stopped.
         "vdd_keep_enabled",       // 由系统托盘控制，不通过Web UI修改
         "vdd_headless_create",    // 由系统托盘控制，不通过Web UI修改
         "tray_locale",            // 由系统托盘控制，不通过Web UI修改

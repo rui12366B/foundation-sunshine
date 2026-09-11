@@ -8,6 +8,8 @@
 // local includes
 #include "parsed_config.h"
 #include "session.h"
+#include "state_retry_timer.h"
+#include "src/platform/windows/display_session_bridge/client.h"
 #include "src/globals.h"
 #include "src/platform/common.h"
 #include "src/platform/windows/display_device/session_listener.h"
@@ -22,115 +24,12 @@
 
 namespace display_device {
 
-  class session_t::StateRetryTimer {
+  class session_t::StateRetryTimer : public detail::state_retry_timer {
   public:
-    /**
-     * @brief A constructor for the timer.
-     * @param mutex A shared mutex for synchronization.
-     * @warning Because we are keeping references to shared parameters, we MUST ensure they outlive this object!
-     */
-    StateRetryTimer(std::mutex &mutex, std::chrono::seconds timeout = std::chrono::seconds { 5 }):
-        mutex { mutex }, timeout_duration { timeout }, timer_thread {
-          std::thread { [this]() {
-            std::unique_lock<std::mutex> lock { this->mutex };
-            while (keep_alive) {
-              can_wake_up = false;
-              if (next_wake_up_time) {
-                // We're going to sleep forever until manually woken up or the time elapses
-                sleep_cv.wait_until(lock, *next_wake_up_time, [this]() { return can_wake_up; });
-              }
-              else {
-                // We're going to sleep forever until manually woken up
-                sleep_cv.wait(lock, [this]() { return can_wake_up; });
-              }
-
-              if (next_wake_up_time) {
-                // Timer has just been started, or we have waited for the required amount of time.
-                // We can check which case it is by comparing time points.
-
-                const auto now { std::chrono::steady_clock::now() };
-                if (now < *next_wake_up_time) {
-                  // Thread has been woken up manually to synchronize the time points.
-                  // We do nothing and just go back to waiting with a new time point.
-                }
-                else {
-                  next_wake_up_time = boost::none;
-
-                  const auto result { !this->retry_function || this->retry_function() };
-                  if (!result) {
-                    next_wake_up_time = now + this->timeout_duration;
-                  }
-                }
-              }
-              else {
-                // Timer has been stopped.
-                // We do nothing and just go back to waiting until notified (unless we are killing the thread).
-              }
-            }
-          } }
-        } {
-    }
-
-    /**
-     * @brief A destructor for the timer that gracefully shuts down the thread.
-     */
-    ~StateRetryTimer() {
-      {
-        std::lock_guard lock { mutex };
-        keep_alive = false;
-        next_wake_up_time = boost::none;
-        wake_up_thread();
-      }
-
-      timer_thread.join();
-    }
-
-    /**
-     * @brief Start or stop the timer thread.
-     * @param retry_function Function to be executed every X seconds.
-     *                       If the function returns true, the loop is stopped.
-     *                       If the function is of type nullptr_t, the loop is stopped.
-     * @warning This method does NOT acquire the mutex! It is intended to be used from places
-     *          where the mutex has already been locked.
-     */
-    void
-    setup_timer(std::function<bool()> retry_function) {
-      this->retry_function = std::move(retry_function);
-
-      if (this->retry_function) {
-        next_wake_up_time = std::chrono::steady_clock::now() + timeout_duration;
-      }
-      else {
-        if (!next_wake_up_time) {
-          return;
-        }
-
-        next_wake_up_time = boost::none;
-      }
-
-      wake_up_thread();
-    }
-
-  private:
-    /**
-     * @brief Manually wake up the thread.
-     */
-    void
-    wake_up_thread() {
-      can_wake_up = true;
-      sleep_cv.notify_one();
-    }
-
-    std::mutex &mutex; /**< A reference to a shared mutex. */
-    std::chrono::seconds timeout_duration { 5 }; /**< A retry time for the timer. */
-    std::function<bool()> retry_function; /**< Function to be executed until it succeeds. */
-
-    std::thread timer_thread; /**< A timer thread. */
-    std::condition_variable sleep_cv; /**< Condition variable for waking up thread. */
-
-    bool can_wake_up { false }; /**< Safeguard for the condition variable to prevent sporadic thread wake ups. */
-    bool keep_alive { true }; /**< A kill switch for the thread when it has been woken up. */
-    boost::optional<std::chrono::steady_clock::time_point> next_wake_up_time; /**< Next time point for thread to wake up. */
+    explicit StateRetryTimer(std::mutex &mutex):
+      detail::state_retry_timer(mutex, std::chrono::seconds(5), [](std::exception_ptr) {
+        BOOST_LOG(error) << "[Display] Retry callback threw; stopping this retry request";
+      }) {}
   };
 
   session_t::deinit_t::~deinit_t() {
@@ -139,12 +38,19 @@ namespace display_device {
 #endif
     // 清理事件监听器
     SessionEventListener::deinit();
+    {
+      auto &state = session_t::get();
+      std::lock_guard lock { state.mutex };
+      state.cancel_pending_display_retry();
+    }
     
     // 兜底：退出时如果 VDD 仍存在且 vdd_keep_enabled=false，直接销毁
     // 使用 nolog 版本，因为析构时 boost::log 可能已被销毁
     if (!config::video.vdd_keep_enabled) {
       vdd_utils::destroy_vdd_monitor_nolog();
     }
+    display_session_bridge::shutdown();
+    display_session_bridge::set_log_callback(nullptr);
   }
 
   session_t &
@@ -155,6 +61,10 @@ namespace display_device {
 
   std::unique_ptr<session_t::deinit_t>
   session_t::init() {
+    display_session_bridge::set_log_callback([](const std::string &message) {
+      BOOST_LOG(info) << message;
+    });
+    display_session_bridge::set_enabled(config::video.display_session_helper);
 #ifdef _WIN32
     // Remove a registration left behind by a terminated Sunshine process
     // before recovering display state or accepting a new stream.
@@ -185,6 +95,7 @@ namespace display_device {
 
   void
   session_t::cancel_pending_display_retry() {
+    ++display_request_generation_;
     pending_restore_ = false;
     SessionEventListener::clear_unlock_task();
     timer->setup_timer(nullptr);
@@ -395,6 +306,13 @@ namespace display_device {
     const rtsp_stream::launch_session_t &session,
     bool is_reconfigure) {
     std::lock_guard lock { mutex };
+    display_session_bridge::transaction_scope display_transaction;
+    // Invalidate queued unlock callbacks even when the same client resumes.
+    // Keep pending_restore_/snapshot until the existing compatibility logic has
+    // decided whether the current VDD can be reused.
+    ++display_request_generation_;
+    SessionEventListener::clear_unlock_task();
+    timer->setup_timer(nullptr);
 
     // 恢复运行中的应用时可能换成另一个客户端。取消旧的延迟恢复任务，
     // 但在完成模式兼容性判断前保留当前 VDD；仅客户端身份变化不要求重建。
@@ -424,7 +342,7 @@ namespace display_device {
     const bool is_rdp_blocking_vdd = !is_running_as_system_user && rdp_session_active;
     const bool use_vdd = parsed_config->use_vdd.value_or(false);
     const bool should_prepare_vdd = use_vdd && !is_rdp_blocking_vdd;
-    const bool is_system_rdp_vdd_session = should_prepare_vdd && is_running_as_system_user && rdp_session_active;
+    const bool is_system_rdp_vdd_session = should_prepare_vdd && is_running_as_system_user && rdp_session_active && !display_session_bridge::enabled();
     if (use_vdd && is_rdp_blocking_vdd) {
       BOOST_LOG(info) << "[Display] RDP环境：强制使用RDP虚拟显示器，跳过VDD准备";
     }
@@ -442,6 +360,19 @@ namespace display_device {
             "Open Sunshine settings, repair the virtual display driver or restart Windows if requested, then try again."
         };
       }
+    }
+
+    // A headless console can legitimately have zero active paths. Probe read
+    // access here, not validation of an empty topology; validate after VDD exists.
+    UINT32 helper_paths = 0, helper_modes = 0;
+    if (display_session_bridge::enabled() &&
+        display_session_bridge::get_buffer_sizes(QDC_ONLY_ACTIVE_PATHS | QDC_VIRTUAL_MODE_AWARE,
+          &helper_paths, &helper_modes) != ERROR_SUCCESS) {
+      return {
+        configure_result_t::result_e::console_access_unavailable,
+        "The console display helper cannot access the target desktop.",
+        "Verify tools/foundation_display_helper.exe is present. Return the intended user session to console and retry. The helper does not unlock Windows or take over arbitrary RDP sessions."
+      };
     }
 
     const bool vulkan_hdr_bridge_requested =
@@ -524,8 +455,19 @@ namespace display_device {
     }
 
     const bool should_defer_display_settings = settings.is_changing_settings_going_to_fail();
+    if (should_defer_display_settings && display_session_bridge::enabled()) {
+      // Do not start capture and then mutate its display paths in the background.
+      // Revert through the existing persistence mechanism; fail rather than
+      // report success for a virtual screen which never became primary.
+      restore_state_impl(revert_reason_e::config_cleanup);
+      return {
+        configure_result_t::result_e::console_access_unavailable,
+        "Console display access changed while preparing the virtual display.",
+        "Reconnect after the console transition completes; check the DisplayHelper log."
+      };
+    }
     if (should_defer_display_settings) {
-      timer->setup_timer([this, config_copy = *parsed_config, client_name = session.client_name,
+      timer->setup_timer([this, generation = display_request_generation_, config_copy = *parsed_config, client_name = session.client_name,
                            client_cert_uuid = session.client_cert_uuid,
                            enable_hdr = session.enable_hdr,
                            hdr_target_source = session.hdr_target_source,
@@ -534,6 +476,8 @@ namespace display_device {
                            pre_vdd_devices = pending_vdd_.pre_vdd_devices,
                            should_prepare_vdd,
                            vulkan_hdr_bridge_requested]() {
+        if (generation != display_request_generation_) return true;
+        display_session_bridge::transaction_scope display_transaction;
         if (settings.is_changing_settings_going_to_fail()) {
           BOOST_LOG(warning) << "[Display Deferred Retry] CCD access is still unavailable; retrying later";
           return false;
@@ -570,8 +514,6 @@ namespace display_device {
         retry_session.hdr_capabilities = hdr_capabilities;
         if (!settings.apply_config(config_copy, retry_session, pre_saved_initial_topology)) {
           BOOST_LOG(warning) << "[Display Deferred Retry] Applying display settings failed; stopping retries while allowing the stream to continue";
-          // WARNING! After call to the method below, this lambda function is no longer valid!
-          // DO NOT access anything from the capture list!
           restore_state_impl(revert_reason_e::config_cleanup);
           return true;
         }
@@ -625,6 +567,23 @@ namespace display_device {
 
     const auto apply_result = settings.apply_config(*parsed_config, session, pre_saved_initial_topology);
     if (apply_result) {
+      const bool primary_required = parsed_config->device_prep == parsed_config_t::device_prep_e::ensure_primary ||
+                                    parsed_config->device_prep == parsed_config_t::device_prep_e::ensure_only_display;
+      if (display_session_bridge::enabled() && primary_required && !parsed_config->device_id.empty()) {
+        bool primary_verified = false;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+          if (is_primary_device(parsed_config->device_id)) { primary_verified = true; break; }
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!primary_verified) {
+          restore_state_impl(revert_reason_e::config_cleanup);
+          return {
+            configure_result_t::result_e::primary_display_fail,
+            "The requested display did not become primary after configuration.",
+            "See Display Session Helper logs; no stream was started on a stale secondary display."
+          };
+        }
+      }
       timer->setup_timer(nullptr);
       pending_vdd_.reset();
 #ifdef _WIN32
@@ -917,6 +876,10 @@ namespace display_device {
 
   void
   session_t::restore_state_impl(revert_reason_e reason) {
+    display_session_bridge::transaction_scope display_transaction;
+    ++display_request_generation_;
+    SessionEventListener::clear_unlock_task();
+    timer->setup_timer(nullptr);
 #ifdef _WIN32
     // Stop exposing the implicit layer before changing HDR state or removing
     // the VDD. The layer itself is pass-through, but registration must remain
@@ -1059,34 +1022,23 @@ namespace display_device {
       pending_restore_ = true;
       
       // 添加恢复任务（自动处理锁屏检查和立即执行）
-      SessionEventListener::add_unlock_task([this, reason]() {
-        // 快速检查是否还需要恢复（最小化锁持有时间）
-        {
-          std::lock_guard lock { mutex };
-          if (!pending_restore_) {
-            BOOST_LOG(info) << "恢复操作已取消，跳过";
-            return;
-          }
-        }
-        
-        // 在锁外执行CCD检查和恢复操作（避免阻塞托盘等其他操作）
-        if (settings.is_changing_settings_going_to_fail()) {
-          BOOST_LOG(warning) << "CCD API仍不可用，启动轮询机制";
-          std::lock_guard lock { mutex };
-          this->start_polling_restore(reason);
+      SessionEventListener::add_unlock_task([this, reason, generation = display_request_generation_]() {
+        // APPLY and RESTORE must be mutually exclusive for the entire operation,
+        // not only for a pre-check. Already-queued callbacks are generation-bound.
+        std::lock_guard lock { mutex };
+        if (!pending_restore_ || generation != display_request_generation_) return;
+        if (rtsp_stream::session_starting_or_active()) {
+          start_polling_restore(reason);
           return;
         }
-        
-        // 执行恢复
-        auto result = settings.revert_settings(reason, true);
-        BOOST_LOG(info) << "恢复显示设置" << (result ? "成功" : "失败");
-        
-        // 恢复完成后清除标志和状态
-        {
-          std::lock_guard lock { mutex };
-          pending_restore_ = false;
-          stop_timer_and_clear_vdd_state();
+        display_session_bridge::transaction_scope display_transaction;
+        if (settings.is_changing_settings_going_to_fail() || !settings.revert_settings(reason, true)) {
+          BOOST_LOG(warning) << "[Display] Restore still unavailable; retaining snapshot and retrying";
+          start_polling_restore(reason);
+          return;
         }
+        BOOST_LOG(info) << "[Display] Deferred restore completed";
+        stop_timer_and_clear_vdd_state();
       });
     }
   }
@@ -1096,31 +1048,23 @@ namespace display_device {
     polling_retry_count_.store(0, boost::memory_order_relaxed);  // 重置计数器
     const int max_retries = 20;
 
-    timer->setup_timer([this, reason, max_retries]() {
-      // 检查是否还需要恢复
-      if (!pending_restore_) {
-        BOOST_LOG(debug) << "恢复操作已取消，跳过";
+    timer->setup_timer([this, reason, max_retries, generation = display_request_generation_]() {
+      if (!pending_restore_ || generation != display_request_generation_) return true;
+      if (rtsp_stream::session_starting_or_active()) return false;
+      display_session_bridge::transaction_scope display_transaction;
+      const auto current_count = polling_retry_count_.fetch_add(1, boost::memory_order_relaxed) + 1;
+      if (!settings.is_changing_settings_going_to_fail() && settings.revert_settings(reason, true)) {
+        BOOST_LOG(info) << "[Display] Polling restore completed";
+        stop_timer_and_clear_vdd_state();
         return true;
       }
-      
-      if (settings.is_changing_settings_going_to_fail()) {
-        const int current_count = polling_retry_count_.fetch_add(1, boost::memory_order_relaxed) + 1;
-        if (current_count >= max_retries) {
-          BOOST_LOG(warning) << "已达到最大重试次数，停止尝试恢复显示设置";
-          pending_restore_ = false;
-          clear_vdd_state();
-          return true;
-        }
-        BOOST_LOG(warning) << "Timer: 仍在等待CCD恢复... (Count: " << current_count << "/" << max_retries << ")";
-        return false;
+      if (current_count >= max_retries) {
+        // Keep persistent state for recovery; never relabel failure as success.
+        BOOST_LOG(warning) << "[Display] Restore retry limit reached; snapshot retained for next recovery";
+        return true;
       }
-
-      // VDD生命周期已由restore_state_impl决定，跳过revert_settings中的VDD销毁
-      auto result = settings.revert_settings(reason, true);
-      BOOST_LOG(info) << "轮询恢复显示设置" << (result ? "成功" : "失败") << "，不再重试";
-      pending_restore_ = false;
-      clear_vdd_state();
-      return true;
+      BOOST_LOG(warning) << "[Display] Restore unavailable; retry " << current_count << "/" << max_retries;
+      return false;
     });
   }
 

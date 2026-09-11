@@ -121,6 +121,8 @@ namespace nvhttp::stream_start {
       using result_e = display_device::session_t::configure_result_t::result_e;
 
       switch (result) {
+        case result_e::console_access_unavailable:
+          return "CONSOLE_DISPLAY_ACCESS_UNAVAILABLE";
         case result_e::vdd_not_installed:
           return "VDD_DRIVER_NOT_INSTALLED";
         case result_e::vdd_unavailable:
@@ -689,6 +691,16 @@ namespace nvhttp::stream_start {
     // Display configuration can change the active capture target, so probe
     // encoders only after the display stack has settled.
     auto display_result = display_device::session_t::get().configure_display(config::video, launch_session, is_reconfigure);
+    // This experimental path is strict: a successful encoder probe cannot turn
+    // a failed primary/topology operation into a successful stream on a stale
+    // secondary display. The original recovery policy stays in place when off.
+    if (config::video.display_session_helper && !display_result) {
+      if (display_result.cleanup_on_failure) {
+        display_device::session_t::get().restore_state();
+      }
+      set_display_config_error(tree, display_result);
+      return false;
+    }
     auto outcome = classify_configure_result(display_result.result);
     if (display_result) {
       hdr::adopt_vdd_calibration_if_needed(launch_session);

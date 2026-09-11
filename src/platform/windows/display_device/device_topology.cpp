@@ -1,3 +1,4 @@
+#include "src/platform/windows/display_session_bridge/client.h"
 // lib includes
 #include <boost/optional.hpp>
 #include <windows.h>
@@ -265,12 +266,12 @@ namespace display_device {
       }
 
       UINT32 flags { SDC_APPLY | SDC_TOPOLOGY_SUPPLIED | SDC_ALLOW_PATH_ORDER_CHANGES | SDC_VIRTUAL_MODE_AWARE };
-      LONG result { SetDisplayConfig(paths.size(), paths.data(), 0, nullptr, flags) };
+      LONG result { display_session_bridge::set_config(paths.size(), paths.data(), 0, nullptr, flags) };
       if (result == ERROR_GEN_FAILURE) {
         BOOST_LOG(warning) << w_utils::get_error_string(result) << " failed to change topology using the topology from Windows DB! Asking Windows to create the topology.";
 
         flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES /* This flag is probably not needed, but who knows really... (not MSDOCS at least) */ | SDC_VIRTUAL_MODE_AWARE | SDC_SAVE_TO_DATABASE;
-        result = SetDisplayConfig(paths.size(), paths.data(), 0, nullptr, flags);
+        result = display_session_bridge::set_config(paths.size(), paths.data(), 0, nullptr, flags);
         if (result != ERROR_SUCCESS) {
           BOOST_LOG(error) << w_utils::get_error_string(result) << " failed to create new topology configuration!";
           return false;
