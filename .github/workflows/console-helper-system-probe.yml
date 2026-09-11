@@ -1,0 +1,82 @@
+name: Read-only console helper integration probe
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: ['.github/workflows/console-helper-system-probe.yml']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: console-helper-native-ucrt64
+          run-id: 34656109437
+          github-token: ${{ github.token }}
+          path: native
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc-libs
+      - name: Query console displays through the real helper without changing modes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:GITHUB_WORKSPACE 'probe-evidence'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          $probe = Join-Path $env:GITHUB_WORKSPACE 'native\helper-checks\bridge_probe.exe'
+          $helper = Join-Path $env:GITHUB_WORKSPACE 'native\helper-checks\tools\foundation_display_helper.exe'
+          if (!(Test-Path $probe) -or !(Test-Path $helper)) { throw 'Matched compiled binaries are missing' }
+          $runnerScript = Join-Path $root 'run-readonly.ps1'
+          $quotedProbe = $probe.Replace("'", "''")
+          $quotedRoot = $root.Replace("'", "''")
+          @"
+          `$ErrorActionPreference = 'Continue'
+          `$env:PATH = 'C:\msys64\ucrt64\bin;' + `$env:PATH
+          whoami /all *> '$quotedRoot\identity.txt'
+          query session *> '$quotedRoot\sessions.txt'
+          & '$quotedProbe' --require-helper *> '$quotedRoot\probe.txt'
+          `$code = `$LASTEXITCODE
+          [System.IO.File]::WriteAllText('$quotedRoot\exit-code.txt', [string]`$code)
+          "@ | Set-Content -Path $runnerScript -Encoding utf8
+          $task = 'FoundationReadOnlyProbe-' + [guid]::NewGuid().ToString('N')
+          try {
+            $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $runnerScript + '"')
+            $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+            $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
+            Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings | Out-Null
+            Start-ScheduledTask -TaskName $task
+            $deadline = (Get-Date).AddSeconds(65)
+            while (!(Test-Path "$root\exit-code.txt") -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+            if (!(Test-Path "$root\exit-code.txt")) { throw 'Read-only SYSTEM task timed out; no successful probe is claimed' }
+            $code = (Get-Content "$root\exit-code.txt" -Raw).Trim()
+            $text = Get-Content "$root\probe.txt" -Raw
+            Write-Host $text
+            $launched = $text.Contains('context=interactive-user') -or $text.Contains('context=SYSTEM-prelogin')
+            $result = [ordered]@{
+              source_commit = '4c8c369c3e167822c4c4b326f7da93da773e14ff'
+              scope = 'read-only real client/helper IPC on hosted Windows, not RDP or Zako modeset'
+              probe_exit_code = $code
+              helper_launched = $launched
+              console_query_passed = ($code -eq '0' -and $launched)
+              status = $(if ($code -eq '0' -and $launched) { 'read-only-console-query-passed' } else { 'not-passed-see-platform-diagnostic' })
+            }
+            $result | ConvertTo-Json | Set-Content "$root\result.json"
+            if (!$text.Contains('adapter=console-helper')) { throw 'Probe did not enter SYSTEM helper path' }
+            if ($code -ne '0') { throw "Console probe returned $code; see captured error, not counted as a passing integration test" }
+            if (!$launched) { throw 'No evidence of helper launch' }
+          } finally {
+            Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: console-helper-readonly-integration-evidence
+          path: probe-evidence
+          retention-days: 7
