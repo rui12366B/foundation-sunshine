@@ -1,0 +1,239 @@
+name: Console helper Windows test installer
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - 'port/console-helper-integration.json'
+      - 'src/**'
+      - 'tools/**'
+      - 'tests/**'
+      - 'cmake/**'
+      - 'scripts/*console*'
+      - '.github/workflows/console-helper-installer.yml'
+permissions:
+  contents: read
+concurrency:
+  group: console-helper-installer-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply content-verified source changes
+        run: python3 scripts/apply-console-helper-port.py
+      - name: Save normal source files without rewriting branch history
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git add -- src cmake tools tests
+          if ! git diff --cached --quiet; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git commit -m 'port(display): integrate console-scoped CCD lifecycle and packaging'
+            git push origin HEAD:master
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  windows:
+    needs: integrate
+    runs-on: windows-latest
+    timeout-minutes: 100
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CCACHE_MAXSIZE: 3G
+      CCACHE_COMPILERCHECK: content
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.integrate.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Initialize pinned Windows submodules
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          git submodule update --init --recursive --depth=1 --jobs=4 -- third-party/build-deps third-party/moonlight-common-c third-party/googletest src_assets/common/sunshine-control-panel third-party/AMF third-party/ViGEmClient third-party/nanors third-party/nvapi third-party/Simple-Web-Server third-party/tray third-party/moonlight-audio-haptics third-party/nvenc-headers/1100 third-party/nvenc-headers/1200 third-party/nvenc-headers/1300 third-party/nvenc-headers/1301
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git wget curl
+            mingw-w64-ucrt-x86_64-ccache mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-lld mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-cppwinrt mingw-w64-ucrt-x86_64-curl-winssl
+            mingw-w64-ucrt-x86_64-graphviz mingw-w64-ucrt-x86_64-MinHook
+            mingw-w64-ucrt-x86_64-miniupnpc mingw-w64-ucrt-x86_64-nlohmann-json
+            mingw-w64-ucrt-x86_64-onevpl mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-autotools
+      - name: Install pinned Opus API
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          pkg=mingw-w64-ucrt-x86_64-opus-1.6.1-1-any.pkg.tar.zst
+          curl --fail --location --retry 3 -o "$pkg" "https://repo.msys2.org/mingw/ucrt64/$pkg"
+          pacman --noconfirm -U "$pkg"
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Prepare verified adapter and system-font assets
+        shell: pwsh
+        run: python scripts/prepare-console-test-build.py
+      - name: Check new Win32 components with UCRT64
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cmake -S tests/display_session_bridge -B helper-checks -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build helper-checks --parallel 2
+          ctest --test-dir helper-checks --output-on-failure
+      - name: Install Inno Setup compiler
+        shell: pwsh
+        run: |
+          $exe = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $exe)) {
+            $installer = "$env:RUNNER_TEMP\innosetup.exe"
+            Invoke-WebRequest 'https://jrsoftware.org/download.php/is.exe' -OutFile $installer
+            $result = Start-Process $installer -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-' -Wait -PassThru
+            if ($result.ExitCode) { exit $result.ExitCode }
+          }
+          if (!(Test-Path $exe)) { throw 'Inno Setup 6 is missing' }
+          Split-Path $exe | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Build Web UI and tests
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run lint:webui
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run test:webui
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:SUNSHINE_SOURCE_ASSETS_DIR = "$env:GITHUB_WORKSPACE\src_assets"
+          $env:SUNSHINE_ASSETS_DIR = "$env:GITHUB_WORKSPACE\build"
+          npm run build
+          exit $LASTEXITCODE
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            src_assets/common/sunshine-control-panel/src-tauri/target
+          key: console-gui-${{ runner.os }}-${{ hashFiles('src_assets/common/sunshine-control-panel/src-tauri/Cargo.lock') }}
+      - name: Build local GUI without embedded font resources
+        shell: pwsh
+        working-directory: src_assets/common/sunshine-control-panel
+        run: |
+          npm ci
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run test:renderer
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run build:native-plugins
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run build:renderer
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo build --manifest-path src-tauri/Cargo.toml --release --locked
+          exit $LASTEXITCODE
+      - name: Build optional DualSense sidecar and manifest
+        shell: pwsh
+        run: |
+          ./scripts/build-ds5-sidecar.ps1 -ReleaseTag 'v2026.911.85650.杂鱼'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: console-core-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: console-core-${{ runner.os }}-
+      - name: Configure main program with HDR enabled
+        shell: msys2 {0}
+        env:
+          BUILD_VERSION: v2026.912.1-console-test
+          BRANCH: console-helper-test
+          COMMIT: ${{ needs.integrate.outputs.source_sha }}
+          CCACHE_DIR: ${{ github.workspace }}\.ccache
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_DOCS=OFF -DBUILD_TESTS=ON -DBUILD_TRAY_TESTS=ON -DBUILD_WEB_UI=OFF \
+            -DSUNSHINE_ASSETS_DIR=assets -DDRIVER_DEPS_REQUIRED=ON \
+            -DSUNSHINE_RTX_HDR=ON -DSUNSHINE_PINNED_RELEASE_ADAPTER_DIR="$(pwd -W)/build/pinned-rtx" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DSUNSHINE_PREFER_LOCAL_GUI=ON \
+            -DSUNSHINE_PUBLISHER_NAME='Console Helper Test Build' \
+            -DSUNSHINE_PUBLISHER_WEBSITE='https://github.com/rui12366B/foundation-sunshine' \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL='https://github.com/rui12366B/foundation-sunshine/issues'
+          grep -q '^SUNSHINE_RTX_HDR_AVAILABLE:INTERNAL=TRUE' build/CMakeCache.txt
+      - name: Compile complete Windows program
+        shell: msys2 {0}
+        env:
+          CCACHE_DIR: ${{ github.workspace }}\.ccache
+        run: |
+          set -euo pipefail
+          cmake --build build --parallel 2 2>&1 | tee build/main-build.log
+          ccache --show-stats
+      - name: Run complete native test suite
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          ctest --test-dir build --output-on-failure 2>&1 | tee build/native-tests.log
+      - name: Stage and audit required binaries
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cmake --install build --prefix build/inno_staging
+          test -f build/inno_staging/sunshine.exe
+          test -f build/inno_staging/tools/foundation_display_helper.exe
+          test -f build/inno_staging/assets/gui/sunshine-gui.exe
+          test -f build/inno_staging/tools/hdr_enhanced/nvidia_rtx_video/foundation_rtx_video_adapter.dll
+          python - <<'PY'
+          import pathlib,sys
+          root=pathlib.Path('build/inno_staging')
+          extensions={'.ttf','.otf','.woff','.woff2','.ttc','.otc','.eot','.dfont','.pfa','.pfb','.fon','.fnt','.bdf','.pcf'}
+          forbidden=[str(p) for p in root.rglob('*') if p.suffix.lower() in extensions or p.name=='nvngx_truehdr.dll']
+          if forbidden: raise SystemExit('Unwanted resources in package: '+repr(forbidden))
+          PY
+      - name: Build installer and portable package
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cmake --build build --target innosetup --parallel 2 2>&1 | tee build/installer-build.log
+          (cd build && cpack -G ZIP --config CPackConfig.cmake)
+          mkdir -p artifacts
+          cp build/cpack_artifacts/Sunshine.exe artifacts/Foundation-ConsoleHelper-Test-Windows-x64.exe
+          cp build/cpack_artifacts/Sunshine.zip artifacts/Foundation-ConsoleHelper-Test-Portable-x64.zip
+          cp build/test-build-provenance.json artifacts/
+          cp build/ds5-sidecar-package/Sunshine.Ds5Sidecar.x64.zip artifacts/
+          sha256sum artifacts/*.exe artifacts/*.zip > artifacts/SHA256SUMS.txt
+      - name: Upload installable test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: foundation-console-helper-test-installer
+          path: artifacts
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload diagnostics even when compilation fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: foundation-console-helper-build-diagnostics
+          path: |
+            build/*.log
+            build/*provenance*.json
+            build/CMakeCache.txt
+            build/CMakeFiles/CMakeConfigureLog.yaml
+            build/Testing/Temporary/*.log
+            helper-checks/Testing/Temporary/*.log
+          retention-days: 7
