@@ -19,6 +19,12 @@ jobs:
           run-id: 34656109437
           github-token: ${{ github.token }}
           path: native
+      - uses: actions/download-artifact@v4
+        with:
+          name: console-helper-readonly-integration-evidence
+          run-id: 34657587631
+          github-token: ${{ github.token }}
+          path: prior-evidence
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -27,7 +33,7 @@ jobs:
       - name: Overlay exact candidate and reuse the failing validation probe
         shell: python
         run: |
-          import hashlib,json,pathlib,urllib.request,zipfile,os
+          import hashlib,json,pathlib,os
           root=pathlib.Path('native'); out=pathlib.Path('evidence');out.mkdir()
           files={
             'session_context.h':('src/platform/windows/display_session_bridge/session_context.h','8566ef0ff3fb1b8fee8113e41571fef091bd568c1709e360f1802d80d9a4d7ae'),
@@ -39,18 +45,12 @@ jobs:
             actual=hashlib.sha256(data).hexdigest()
             assert actual==expected,(name,actual)
             (root/target).write_bytes(data);manifest[target]=actual
+          names=list(pathlib.Path('prior-evidence').rglob('probe_windows.cpp'))
+          assert len(names)==1, names
+          source=names[0].read_bytes()
+          (root/'tests/display_session_bridge/probe_windows.cpp').write_bytes(source)
+          manifest['probe_windows.cpp']=hashlib.sha256(source).hexdigest()
           (out/'source.json').write_text(json.dumps({'commit':os.environ['GITHUB_SHA'],'files':manifest},indent=2))
-          # Download only the earlier test source artifact, not executable third-party code.
-          req=urllib.request.Request('https://api.github.com/repos/rui12366B/foundation-sunshine/actions/artifacts/10286253104/zip',headers={'Authorization':'Bearer '+os.environ['GH_TOKEN']})
-          with urllib.request.urlopen(req) as response: blob=response.read()
-          pathlib.Path('prior-evidence.zip').write_bytes(blob)
-          assert hashlib.sha256(blob).hexdigest()=='544368f6f51b37442cd13b63ca995c51e8ee77ee8267829c7538a16adbd254b4'
-          with zipfile.ZipFile('prior-evidence.zip') as z:
-            names=[name for name in z.namelist() if name.endswith('/probe_windows.cpp')]
-            assert len(names)==1
-            source=z.read(names[0]);(root/'tests/display_session_bridge/probe_windows.cpp').write_bytes(source)
-        env:
-          GH_TOKEN: ${{ github.token }}
       - name: Compile candidate and run native component tests
         shell: msys2 {0}
         run: |
