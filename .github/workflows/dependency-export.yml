@@ -1,0 +1,117 @@
+name: Export pinned Windows dependencies
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: [.github/workflows/dependency-export.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Read the pinned Foundation baseline
+        uses: actions/checkout@v4
+        with:
+          repository: AlkaidLab/foundation-sunshine
+          ref: 645465c54f9615c999452ebee04f2c0046446e2d
+          path: foundation-base
+          persist-credentials: false
+      - name: Fetch and package pinned dependencies without executing their code
+        shell: python
+        run: |
+          import configparser, hashlib, json, os, pathlib, shutil, subprocess, tarfile
+          base = pathlib.Path('foundation-base').resolve()
+          destination = pathlib.Path('recovered-dependencies').resolve()
+          destination.mkdir()
+          work = pathlib.Path('dependency-checkouts').resolve()
+          work.mkdir()
+          selected = {
+              'third-party/build-deps', 'third-party/moonlight-common-c',
+              'third-party/googletest', 'src_assets/common/sunshine-control-panel',
+              'third-party/AMF', 'third-party/ViGEmClient', 'third-party/nanors',
+              'third-party/nvapi', 'third-party/Simple-Web-Server', 'third-party/tray',
+              'third-party/moonlight-audio-haptics',
+              'third-party/nvenc-headers/1100', 'third-party/nvenc-headers/1200',
+              'third-party/nvenc-headers/1300', 'third-party/nvenc-headers/1301',
+          }
+          env = dict(os.environ, GIT_TERMINAL_PROMPT='0', GIT_LFS_SKIP_SMUDGE='1')
+          def git(folder, *arguments):
+              result = subprocess.run(['git', '-c', 'protocol.file.allow=never', '-C', str(folder), *arguments],
+                                      env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
+              if result.returncode:
+                  raise RuntimeError(result.stderr[-5000:])
+              return result.stdout.strip()
+          config = configparser.ConfigParser(interpolation=None)
+          config.read(base / '.gitmodules')
+          results = []
+          font_suffixes = {'.ttf', '.otf', '.woff', '.woff2', '.ttc', '.otc', '.eot', '.dfont', '.pfa', '.pfb', '.fon', '.fnt', '.bdf', '.pcf'}
+          def omit(folder, names):
+              return [name for name in names if name == '.git' or pathlib.Path(name).suffix.lower() in font_suffixes or 'font' in name.lower() or (pathlib.Path(folder) / name).is_symlink()]
+          for section in config.sections():
+              path = config[section].get('path', '')
+              if path not in selected:
+                  continue
+              url = config[section]['url']
+              record = {'path': path, 'url': url, 'status': 'failed'}
+              results.append(record)
+              try:
+                  if not url.startswith('https://'):
+                      raise RuntimeError('Only HTTPS dependency sources are allowed')
+                  tree_entry = git(base, 'ls-tree', 'HEAD', '--', path).split()
+                  if len(tree_entry) < 3 or tree_entry[0] != '160000':
+                      raise RuntimeError('Path is not a pinned gitlink')
+                  commit = tree_entry[2]
+                  record['commit'] = commit
+                  checkout = work / str(len(results))
+                  checkout.mkdir()
+                  git(checkout, 'init')
+                  git(checkout, 'remote', 'add', 'origin', url)
+                  git(checkout, 'fetch', '--depth=1', '--filter=blob:none', 'origin', commit)
+                  if path == 'third-party/build-deps':
+                      git(checkout, 'sparse-checkout', 'init', '--cone')
+                      git(checkout, 'sparse-checkout', 'set', 'dist/Windows-AMD64')
+                      record['subset'] = 'dist/Windows-AMD64 and root metadata only'
+                  git(checkout, 'checkout', '--detach', 'FETCH_HEAD')
+                  if git(checkout, 'rev-parse', 'HEAD') != commit:
+                      raise RuntimeError('Commit verification failed')
+                  git(checkout, 'submodule', 'update', '--init', '--recursive', '--depth=1')
+                  record['nested_gitlinks'] = git(checkout, 'submodule', 'status', '--recursive')
+                  target = destination / path
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copytree(checkout, target, ignore=omit)
+                  record['status'] = 'downloaded'
+                  print('DOWNLOADED', path, commit, flush=True)
+              except Exception as error:
+                  record['error'] = str(error)
+                  print('FAILED', path, str(error), flush=True)
+          for path in sorted(selected - {item['path'] for item in results}):
+              results.append({'path': path, 'status': 'failed', 'error': 'Missing from pinned .gitmodules'})
+          report = {'foundation_commit': '645465c54f9615c999452ebee04f2c0046446e2d', 'dependencies': results,
+                    'scope': 'Selected Windows dependencies; not a complete offline build or compiled program',
+                    'omitted': 'Git metadata, font resources, symlinks; non-Windows build-deps distributions'}
+          hashes = {}
+          for path in sorted(destination.rglob('*')):
+              if path.is_file():
+                  with path.open('rb') as stream:
+                      hashes[str(path.relative_to(destination))] = hashlib.file_digest(stream, 'sha256').hexdigest()
+          (destination / 'SHA256-MANIFEST.json').write_text(json.dumps(hashes, indent=2), encoding='utf-8')
+          pathlib.Path('dependency-export-report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+          with tarfile.open('recovered-dependencies.tar.gz', 'w:gz') as archive:
+              archive.add(destination, arcname='recovered-dependencies')
+          if any(item['status'] != 'downloaded' for item in results):
+              raise SystemExit('Partial export; see report. Successful downloads are still uploaded.')
+      - name: Return archives and a truthful completion report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: foundation-pinned-windows-dependencies
+          path: |
+            recovered-dependencies.tar.gz
+            dependency-export-report.json
+          if-no-files-found: error
+          retention-days: 7
