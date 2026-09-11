@@ -10,7 +10,7 @@ permissions:
 jobs:
   probe:
     runs-on: windows-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -22,61 +22,133 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: mingw-w64-ucrt-x86_64-gcc-libs
-      - name: Query console displays through the real helper without changing modes
+          install: mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+      - name: Add a validation-only integration probe to the downloaded test source
+        shell: python
+        run: |
+          from pathlib import Path
+          source = r'''
+          #include "src/platform/windows/display_session_bridge/client.h"
+          #include <iostream>
+          #include <string_view>
+          #include <wtsapi32.h>
+          using namespace display_session_bridge;
+          int lock_state() {
+            LPWSTR data=nullptr; DWORD count=0;
+            if(!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE,WTSGetActiveConsoleSessionId(),WTSSessionInfoEx,&data,&count)) return -1;
+            int result=-1;
+            if(count>=sizeof(WTSINFOEXW) && reinterpret_cast<WTSINFOEXW*>(data)->Level==1)
+              result=static_cast<int>(reinterpret_cast<WTSINFOEXW*>(data)->Data.WTSInfoExLevel1.SessionFlags);
+            if(data) WTSFreeMemory(data);
+            return result;
+          }
+          int main(int argc,char**argv) {
+            const std::string_view mode=argc==2?argv[1]:"";
+            if(mode=="--lock-isolated-runner") {
+              if(process_is_system()) return 2;
+              std::cout << "lock_before=" << lock_state() << '\n';
+              if(lock_state()!=WTS_SESSIONSTATE_LOCK && !LockWorkStation()) return 3;
+              for(int i=0;i<100 && lock_state()!=WTS_SESSIONSTATE_LOCK;++i) Sleep(100);
+              std::cout << "lock_after=" << lock_state() << '\n';
+              return lock_state()==WTS_SESSIONSTATE_LOCK?0:4;
+            }
+            if(mode!="--normal" && mode!="--locked") return 2;
+            set_enabled(true);
+            set_log_callback([](const std::string&s){std::cout << s << '\n';});
+            std::cout << "adapter=" << (enabled()?"console-helper":"native-nonSYSTEM")
+                      << " console=" << WTSGetActiveConsoleSessionId() << " lock=" << lock_state() << '\n';
+            if(!enabled()) return 3;
+            if(mode=="--locked" && lock_state()!=WTS_SESSIONSTATE_LOCK) return 4;
+            constexpr UINT32 query_flags=QDC_ONLY_ACTIVE_PATHS|QDC_VIRTUAL_MODE_AWARE;
+            for(int iteration=0;iteration<4;++iteration) {
+              transaction_scope scope; UINT32 n=0,m=0;
+              LONG result=get_buffer_sizes(query_flags,&n,&m);
+              if(result!=ERROR_SUCCESS) {std::cout << "sizes=" << result << '\n';shutdown();return 5;}
+              if(!n) {std::cout << "no active display; cannot validate\n";shutdown();return 6;}
+              std::vector<DISPLAYCONFIG_PATH_INFO> paths(n);std::vector<DISPLAYCONFIG_MODE_INFO> modes(m);
+              result=query_config(query_flags,&n,paths.data(),&m,modes.data(),nullptr);
+              if(result!=ERROR_SUCCESS) {std::cout << "query=" << result << '\n';shutdown();return 7;}
+              for(UINT32 index=0;index<n;++index) {
+                DISPLAYCONFIG_SOURCE_DEVICE_NAME name{};name.header.type=DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+                name.header.size=sizeof(name);name.header.adapterId=paths[index].sourceInfo.adapterId;name.header.id=paths[index].sourceInfo.id;
+                result=get_device_info(&name.header);
+                if(result!=ERROR_SUCCESS) {std::cout << "get_info=" << result << '\n';shutdown();return 8;}
+              }
+              // VALIDATE only. Never SDC_APPLY, never save/change the runner's layout.
+              result=set_config(n,paths.data(),m,modes.data(),SDC_VALIDATE|SDC_USE_SUPPLIED_DISPLAY_CONFIG|SDC_VIRTUAL_MODE_AWARE);
+              std::cout << "iteration=" << iteration << " validate=" << result << " paths=" << n << " modes=" << m << " lock=" << lock_state() << '\n';
+              shutdown(); // The next iteration must launch a fresh, matching helper.
+              if(result!=ERROR_SUCCESS) return 9;
+            }
+            return 0;
+          }
+          '''
+          Path('native/tests/display_session_bridge/probe_windows.cpp').write_text(source,encoding='utf-8')
+      - name: Build the validation probe against the exact tested helper sources
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cmake -S native/tests/display_session_bridge -B native/probe-build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build native/probe-build --target bridge_probe --parallel 2
+      - name: Query and validate normal and locked console contexts
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $root = Join-Path $env:GITHUB_WORKSPACE 'probe-evidence'
           New-Item -ItemType Directory -Force $root | Out-Null
-          $probe = Join-Path $env:GITHUB_WORKSPACE 'native\helper-checks\bridge_probe.exe'
-          $helper = Join-Path $env:GITHUB_WORKSPACE 'native\helper-checks\tools\foundation_display_helper.exe'
-          if (!(Test-Path $probe) -or !(Test-Path $helper)) { throw 'Matched compiled binaries are missing' }
-          $runnerScript = Join-Path $root 'run-readonly.ps1'
+          $probe = Join-Path $env:GITHUB_WORKSPACE 'native\probe-build\bridge_probe.exe'
           $quotedProbe = $probe.Replace("'", "''")
           $quotedRoot = $root.Replace("'", "''")
-          @"
+          $results = @()
+          foreach ($phase in @('normal','locked')) {
+            if ($phase -eq 'locked') {
+              # Only this ephemeral CI worker is locked. No target/user host is contacted,
+              # and no password or automatic-unlock procedure is used.
+              $env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
+              & $probe --lock-isolated-runner *> "$root\lock-request.txt"
+              if ($LASTEXITCODE) { throw 'Isolated runner did not enter the locked state; test is not passed' }
+            }
+            $runnerScript = Join-Path $root "run-$phase.ps1"
+            @"
           `$ErrorActionPreference = 'Continue'
           `$env:PATH = 'C:\msys64\ucrt64\bin;' + `$env:PATH
-          whoami /all *> '$quotedRoot\identity.txt'
-          query session *> '$quotedRoot\sessions.txt'
-          & '$quotedProbe' --require-helper *> '$quotedRoot\probe.txt'
+          whoami /all *> '$quotedRoot\identity-$phase.txt'
+          query session *> '$quotedRoot\sessions-$phase.txt'
+          & '$quotedProbe' --$phase *> '$quotedRoot\probe-$phase.txt'
           `$code = `$LASTEXITCODE
-          [System.IO.File]::WriteAllText('$quotedRoot\exit-code.txt', [string]`$code)
+          [System.IO.File]::WriteAllText('$quotedRoot\exit-$phase.txt', [string]`$code)
           "@ | Set-Content -Path $runnerScript -Encoding utf8
-          $task = 'FoundationReadOnlyProbe-' + [guid]::NewGuid().ToString('N')
-          try {
-            $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $runnerScript + '"')
-            $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-            $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
-            Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings | Out-Null
-            Start-ScheduledTask -TaskName $task
-            $deadline = (Get-Date).AddSeconds(65)
-            while (!(Test-Path "$root\exit-code.txt") -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
-            if (!(Test-Path "$root\exit-code.txt")) { throw 'Read-only SYSTEM task timed out; no successful probe is claimed' }
-            $code = (Get-Content "$root\exit-code.txt" -Raw).Trim()
-            $text = Get-Content "$root\probe.txt" -Raw
-            Write-Host $text
-            $launched = $text.Contains('context=interactive-user') -or $text.Contains('context=SYSTEM-prelogin')
-            $result = [ordered]@{
-              source_commit = '4c8c369c3e167822c4c4b326f7da93da773e14ff'
-              scope = 'read-only real client/helper IPC on hosted Windows, not RDP or Zako modeset'
-              probe_exit_code = $code
-              helper_launched = $launched
-              console_query_passed = ($code -eq '0' -and $launched)
-              status = $(if ($code -eq '0' -and $launched) { 'read-only-console-query-passed' } else { 'not-passed-see-platform-diagnostic' })
+            $task = 'FoundationReadOnlyProbe-' + [guid]::NewGuid().ToString('N')
+            try {
+              $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $runnerScript + '"')
+              $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+              $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
+              Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings | Out-Null
+              Start-ScheduledTask -TaskName $task
+              $deadline = (Get-Date).AddSeconds(65)
+              while (!(Test-Path "$root\exit-$phase.txt") -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+              if (!(Test-Path "$root\exit-$phase.txt")) { throw 'SYSTEM validation probe timed out' }
+              $code = (Get-Content "$root\exit-$phase.txt" -Raw).Trim()
+              $text = Get-Content "$root\probe-$phase.txt" -Raw
+              Write-Host $text
+              $passed = $code -eq '0' -and $text.Contains('adapter=console-helper') -and $text.Contains('iteration=3 validate=0')
+              $results += [ordered]@{ phase=$phase; probe_exit_code=$code; passed=$passed }
+              [ordered]@{
+                source_commit='4c8c369c3e167822c4c4b326f7da93da773e14ff'
+                scope='isolated Windows SYSTEM -> user helper, CCD query/get-info/VALIDATE and cold restart; no modeset, RDP, Zako, or GPU encoding'
+                results=$results
+              } | ConvertTo-Json -Depth 5 | Set-Content "$root\result.json"
+              if (!$passed) { throw "Console $phase validation did not pass; inspect the captured API error" }
+            } finally {
+              Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+              Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
             }
-            $result | ConvertTo-Json | Set-Content "$root\result.json"
-            if (!$text.Contains('adapter=console-helper')) { throw 'Probe did not enter SYSTEM helper path' }
-            if ($code -ne '0') { throw "Console probe returned $code; see captured error, not counted as a passing integration test" }
-            if (!$launched) { throw 'No evidence of helper launch' }
-          } finally {
-            Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
-            Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
           }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: console-helper-readonly-integration-evidence
-          path: probe-evidence
+          path: |
+            probe-evidence
+            native/tests/display_session_bridge/probe_windows.cpp
           retention-days: 7
