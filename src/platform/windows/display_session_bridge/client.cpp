@@ -6,6 +6,7 @@
 #include "client.h"
 #include "protocol.h"
 #include "transport.h"
+#include "session_context.h"
 #include <bcrypt.h>
 #include <sddl.h>
 #include <userenv.h>
@@ -24,14 +25,10 @@ namespace display_session_bridge {
     void note(const std::string &message) {
       if (const auto sink = logger.load()) sink("[Display Session Helper] " + message);
     }
-    struct identity {
-      DWORD session {wire::invalid_session};
-      LUID authentication {};
-      std::wstring sid;
-      bool system_fallback {};
+    struct identity : console_principal {
+      execution_context context {execution_context::user};
       bool operator==(const identity &other) const {
-        return session == other.session && authentication.LowPart == other.authentication.LowPart &&
-          authentication.HighPart == other.authentication.HighPart && sid == other.sid && system_fallback == other.system_fallback;
+        return same_login(other) && context == other.context;
       }
     };
     thread_local std::optional<identity> pinned_identity;
@@ -39,40 +36,39 @@ namespace display_session_bridge {
       void *data {};
       ~environment() { if (data) DestroyEnvironmentBlock(data); }
     };
-    // A single console is selected. A missing existing-user token is a hard error,
-    // not permission to operate as SYSTEM or to select another logged-in user.
+    // Select only the active console. Locked-desktop operations use the service's
+    // own SYSTEM token, but remain pinned to the existing user's SID/logon ID.
+    // No password, automatic unlocking, RDP takeover, or access-check bypass.
     DWORD acquire_identity(DWORD session, identity &who, handle &token) {
-      if (session == wire::invalid_session || WTSGetActiveConsoleSessionId() != session) return ERROR_NO_SUCH_LOGON_SESSION;
-      LPWSTR name = nullptr; DWORD bytes = 0;
-      if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session, WTSUserName, &name, &bytes)) return GetLastError();
-      const bool has_user = name && bytes >= sizeof(wchar_t) && name[0] != L'\0';
-      if (name) WTSFreeMemory(name);
-      HANDLE raw = nullptr; who.session = session;
+      if (!process_is_system()) return ERROR_ACCESS_DENIED;
+      bool has_user = false, locked = false;
+      DWORD error = inspect_console(session, has_user, locked);
+      if (error) return error;
+      who.session = session;
+      HANDLE raw = nullptr;
       if (has_user) {
         if (!WTSQueryUserToken(session, &raw)) return GetLastError();
+        who.context = locked ? execution_context::locked_console : execution_context::user;
       } else {
-        if (!process_is_system()) return ERROR_ACCESS_DENIED;
         if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &raw)) return GetLastError();
-        who.system_fallback = true;
+        who.context = execution_context::prelogin;
       }
-      handle source(raw); raw = nullptr;
+      handle source(raw);
+      error = read_token_principal(source.get(), who);
+      if (error) return error;
+      if (who.context == execution_context::locked_console) {
+        raw = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &raw)) return GetLastError();
+        source.reset(raw);
+      }
+      raw = nullptr;
       if (!DuplicateTokenEx(source.get(), MAXIMUM_ALLOWED, nullptr, SecurityImpersonation, TokenPrimary, &raw)) return GetLastError();
       token.reset(raw);
-      if (who.system_fallback && !SetTokenInformation(token.get(), TokenSessionId, &session, sizeof(session))) return GetLastError();
+      if (uses_system(who.context) && !SetTokenInformation(token.get(), TokenSessionId, &session, sizeof(session))) return GetLastError();
       DWORD actual_session = wire::invalid_session, required = 0;
       if (!GetTokenInformation(token.get(), TokenSessionId, &actual_session, sizeof(actual_session), &required)) return GetLastError();
       if (actual_session != session) return ERROR_NO_SUCH_LOGON_SESSION;
-      TOKEN_STATISTICS stats {};
-      if (!GetTokenInformation(token.get(), TokenStatistics, &stats, sizeof(stats), &required)) return GetLastError();
-      who.authentication = stats.AuthenticationId;
-      required = 0; GetTokenInformation(token.get(), TokenUser, nullptr, 0, &required);
-      if (!required) return ERROR_INVALID_DATA;
-      std::vector<std::uint8_t> data(required);
-      if (!GetTokenInformation(token.get(), TokenUser, data.data(), required, &required)) return GetLastError();
-      LPWSTR sid = nullptr;
-      if (!ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER *>(data.data())->User.Sid, &sid)) return GetLastError();
-      who.sid = sid; LocalFree(sid);
-      return WTSGetActiveConsoleSessionId() == session ? ERROR_SUCCESS : ERROR_NO_SUCH_LOGON_SESSION;
+      return verify_console_context(who.context, who, false);
     }
     std::wstring make_pipe_name() {
       std::array<unsigned char, 16> random {};
@@ -100,7 +96,8 @@ namespace display_session_bridge {
         wire::header reply;
         if (!error) error = receive_packet(pipe_.get(), reply, response, deadline, process_.get());
         if (!error && !wire::matches(request, reply)) error = ERROR_INVALID_DATA;
-        if (!error && WTSGetActiveConsoleSessionId() != session) error = ERROR_NO_SUCH_LOGON_SESSION;
+        if (!error && identity_) error = verify_console_context(identity_->context, *identity_, false);
+        if (!error && !identity_) error = ERROR_NO_SUCH_LOGON_SESSION;
         if (error) {
           note("request failed: winerr=" + std::to_string(error) + "; quarantining helper before retry");
           poisoned_ = true; stop_locked(); response.clear(); return static_cast<LONG>(error);
@@ -139,7 +136,8 @@ namespace display_session_bridge {
         }
         const auto pipe_name = make_pipe_name();
         if (pipe_name.empty()) return ERROR_GEN_FAILURE;
-        const std::wstring sddl = L"D:P(A;;GA;;;SY)(A;;GA;;;" + desired.sid + L")";
+        const std::wstring sddl = uses_system(desired.context) ? L"D:P(A;;GA;;;SY)" :
+          L"D:P(A;;GA;;;SY)(A;;GA;;;" + desired.sid + L")";
         PSECURITY_DESCRIPTOR descriptor = nullptr;
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr)) return GetLastError();
         SECURITY_ATTRIBUTES attributes {sizeof(SECURITY_ATTRIBUTES), descriptor, FALSE};
@@ -157,7 +155,11 @@ namespace display_session_bridge {
         environment env;
         if (!CreateEnvironmentBlock(&env.data, token.get(), FALSE)) { error = GetLastError(); stop_locked(); return error; }
         const std::wstring command = L"\"" + exe.wstring() + L"\" --pipe \"" + pipe_name + L"\" --parent " +
-          std::to_wstring(GetCurrentProcessId()) + L" --session " + std::to_wstring(session);
+          std::to_wstring(GetCurrentProcessId()) + L" --session " + std::to_wstring(session) +
+          L" --context " + context_argument(desired.context) +
+          L" --auth-low " + std::to_wstring(desired.authentication.LowPart) +
+          L" --auth-high " + std::to_wstring(static_cast<DWORD>(desired.authentication.HighPart)) +
+          L" --sid \"" + desired.sid + L"\"";
         STARTUPINFOW si {}; si.cb = sizeof(si); PROCESS_INFORMATION pi {};
         const auto launch = [&](const wchar_t *desktop) {
           std::vector<wchar_t> mutable_command(command.begin(), command.end()); mutable_command.push_back(L'\0');
@@ -166,7 +168,7 @@ namespace display_session_bridge {
             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED, env.data, exe.parent_path().c_str(), &si, &pi);
         };
         BOOL started = launch(L"winsta0\\default");
-        if (!started && desired.system_fallback) started = launch(L"winsta0\\winlogon");
+        if (!started && uses_system(desired.context)) started = launch(L"winsta0\\winlogon");
         if (!started) { error = GetLastError(); stop_locked(); return error; }
         process_.reset(pi.hProcess); handle thread(pi.hThread);
         if (!AssignProcessToJobObject(job_.get(), process_.get())) { error = GetLastError(); stop_locked(); return error; }
@@ -194,10 +196,11 @@ namespace display_session_bridge {
           DisconnectNamedPipe(pipe_.get()); error = ERROR_ACCESS_DENIED;
         }
         if (!connected) { stop_locked(); return error ? error : ERROR_TIMEOUT; }
-        if (WTSGetActiveConsoleSessionId() != session) { stop_locked(); return ERROR_NO_SUCH_LOGON_SESSION; }
+        error = verify_console_context(desired.context, desired, false);
+        if (error) { stop_locked(); return error; }
         identity_ = desired; ++generation_; if (!generation_) ++generation_; sequence_ = 0;
         note("started console=" + std::to_string(session) + ", pid=" + std::to_string(pi.dwProcessId) +
-          (desired.system_fallback ? ", context=SYSTEM-prelogin" : ", context=interactive-user"));
+          std::string(", context=") + context_description(desired.context));
         return ERROR_SUCCESS;
       }
       std::mutex mutex_;

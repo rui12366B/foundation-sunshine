@@ -157,10 +157,13 @@ jobs:
           path: .ccache
           key: console-core-${{ runner.os }}-${{ github.run_id }}
           restore-keys: console-core-${{ runner.os }}-
+      - name: Verify dependency checkouts immediately before CMake
+        shell: pwsh
+        run: python scripts/console-build-preflight.py
       - name: Configure main program with HDR enabled
         shell: msys2 {0}
         env:
-          BUILD_VERSION: v2026.912.1-console-test
+          BUILD_VERSION: v2026.912.2-console-test
           BRANCH: console-helper-test
           COMMIT: ${{ needs.integrate.outputs.source_sha }}
           CCACHE_DIR: ${{ github.workspace }}\.ccache
@@ -168,13 +171,14 @@ jobs:
           set -euo pipefail
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_DOCS=OFF -DBUILD_TESTS=ON -DBUILD_TRAY_TESTS=ON -DBUILD_WEB_UI=OFF \
+            -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST="$(pwd -W)/build/pinned-sources/googletest" \
             -DSUNSHINE_ASSETS_DIR=assets -DDRIVER_DEPS_REQUIRED=ON \
             -DSUNSHINE_RTX_HDR=ON -DSUNSHINE_PINNED_RELEASE_ADAPTER_DIR="$(pwd -W)/build/pinned-rtx" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DSUNSHINE_PREFER_LOCAL_GUI=ON \
             -DSUNSHINE_PUBLISHER_NAME='Console Helper Test Build' \
             -DSUNSHINE_PUBLISHER_WEBSITE='https://github.com/rui12366B/foundation-sunshine' \
-            -DSUNSHINE_PUBLISHER_ISSUE_URL='https://github.com/rui12366B/foundation-sunshine/issues'
+            -DSUNSHINE_PUBLISHER_ISSUE_URL='https://github.com/rui12366B/foundation-sunshine/issues' 2>&1 | tee build/configure-main.log
           grep -q '^SUNSHINE_RTX_HDR_AVAILABLE:INTERNAL=TRUE' build/CMakeCache.txt
       - name: Compile complete Windows program
         shell: msys2 {0}
@@ -199,7 +203,7 @@ jobs:
           test -f build/inno_staging/assets/gui/sunshine-gui.exe
           test -f build/inno_staging/tools/hdr_enhanced/nvidia_rtx_video/foundation_rtx_video_adapter.dll
           python - <<'PY'
-          import pathlib,sys
+          import pathlib
           root=pathlib.Path('build/inno_staging')
           extensions={'.ttf','.otf','.woff','.woff2','.ttc','.otc','.eot','.dfont','.pfa','.pfb','.fon','.fnt','.bdf','.pcf'}
           forbidden=[str(p) for p in root.rglob('*') if p.suffix.lower() in extensions or p.name=='nvngx_truehdr.dll']
@@ -232,6 +236,7 @@ jobs:
           path: |
             build/*.log
             build/*provenance*.json
+            build/source-preflight.json
             build/CMakeCache.txt
             build/CMakeFiles/CMakeConfigureLog.yaml
             build/Testing/Temporary/*.log
