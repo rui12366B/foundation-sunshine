@@ -1,0 +1,69 @@
+name: Prepare local console GUI build cache
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: ['.github/workflows/console-gui-cache.yml']
+permissions:
+  contents: read
+jobs:
+  gui:
+    runs-on: windows-latest
+    timeout-minutes: 50
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Fetch exactly the pinned GUI sources
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          git submodule update --init --recursive --depth=1 -- src_assets/common/sunshine-control-panel
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          $entry=git ls-tree HEAD -- src_assets/common/sunshine-control-panel
+          $actual=git -C src_assets/common/sunshine-control-panel rev-parse HEAD
+          if(!$entry.Contains($actual)){throw 'GUI gitlink mismatch'}
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - uses: actions/cache/restore@v4
+        id: cache
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            src_assets/common/sunshine-control-panel/src-tauri/target
+          key: console-gui-v2-${{ runner.os }}-${{ hashFiles('src_assets/common/sunshine-control-panel/src-tauri/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            console-gui-v2-${{ runner.os }}-${{ hashFiles('src_assets/common/sunshine-control-panel/src-tauri/Cargo.lock') }}-
+            console-gui-${{ runner.os }}-
+      - name: Use the same system-font and SVG preparation as the installer build
+        shell: pwsh
+        run: python scripts/prepare-console-test-build.py
+      - name: Compile and test the entire local GUI
+        id: build
+        shell: pwsh
+        working-directory: src_assets/common/sunshine-control-panel
+        run: |
+          npm ci
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          npm run test:renderer
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          npm run build:native-plugins
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          npm run build:renderer
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          cargo build --manifest-path src-tauri/Cargo.toml --release --locked
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          if(!(Test-Path src-tauri/target/release/sunshine-gui.exe)){throw 'GUI output missing'}
+          if(!(Test-Path src-tauri/target/release/alkaidlab-plugin-stylus.dll)){throw 'Stylus plugin output missing'}
+      - uses: actions/cache/save@v4
+        if: always() && steps.build.outcome != 'skipped' && steps.build.outcome != ''
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            src_assets/common/sunshine-control-panel/src-tauri/target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
