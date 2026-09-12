@@ -28,9 +28,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Apply content-verified source changes
-        run: python3 scripts/apply-console-helper-port.py
-      - name: Save normal source files without rewriting branch history
+      - run: python3 scripts/apply-console-helper-port.py
+      - name: Save verified source without rewriting history
         id: source
         shell: bash
         run: |
@@ -40,18 +39,19 @@ jobs:
           if ! git diff --cached --quiet; then
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git commit -m 'port(display): integrate console-scoped CCD lifecycle and packaging'
+            git commit -m 'port(display): integrate content-verified console helper sources'
             git push origin HEAD:master
           fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   windows:
     needs: integrate
     runs-on: windows-latest
-    timeout-minutes: 100
+    timeout-minutes: 110
     env:
       CARGO_BUILD_JOBS: '2'
       CCACHE_MAXSIZE: 3G
       CCACHE_COMPILERCHECK: content
+      CCACHE_DIR: ${{ github.workspace }}\.ccache
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,7 +63,7 @@ jobs:
         run: |
           git config --global core.longpaths true
           git submodule update --init --recursive --depth=1 --jobs=4 -- third-party/build-deps third-party/moonlight-common-c third-party/googletest src_assets/common/sunshine-control-panel third-party/AMF third-party/ViGEmClient third-party/nanors third-party/nvapi third-party/Simple-Web-Server third-party/tray third-party/moonlight-audio-haptics third-party/nvenc-headers/1100 third-party/nvenc-headers/1200 third-party/nvenc-headers/1300 third-party/nvenc-headers/1301
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          exit $LASTEXITCODE
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -94,7 +94,7 @@ jobs:
       - name: Prepare verified adapter and system-font assets
         shell: pwsh
         run: python scripts/prepare-console-test-build.py
-      - name: Check new Win32 components with UCRT64
+      - name: Check new Win32 components
         shell: msys2 {0}
         run: |
           set -euo pipefail
@@ -104,69 +104,50 @@ jobs:
       - name: Install Inno Setup compiler
         shell: pwsh
         run: |
-          $exe = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (!(Test-Path $exe)) {
-            $installer = "$env:RUNNER_TEMP\innosetup.exe"
+          $exe="${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if(!(Test-Path $exe)) {
+            $installer="$env:RUNNER_TEMP\innosetup.exe"
             Invoke-WebRequest 'https://jrsoftware.org/download.php/is.exe' -OutFile $installer
-            $result = Start-Process $installer -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-' -Wait -PassThru
-            if ($result.ExitCode) { exit $result.ExitCode }
+            $p=Start-Process $installer -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-' -Wait -PassThru
+            if($p.ExitCode){exit $p.ExitCode}
           }
-          if (!(Test-Path $exe)) { throw 'Inno Setup 6 is missing' }
+          if(!(Test-Path $exe)){throw 'Inno Setup 6 is missing'}
           Split-Path $exe | Out-File -FilePath $env:GITHUB_PATH -Append
       - name: Build Web UI and tests
         shell: pwsh
         run: |
           npm ci
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if($LASTEXITCODE){exit $LASTEXITCODE}
           npm run lint:webui
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if($LASTEXITCODE){exit $LASTEXITCODE}
           npm run test:webui
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $env:SUNSHINE_SOURCE_ASSETS_DIR = "$env:GITHUB_WORKSPACE\src_assets"
-          $env:SUNSHINE_ASSETS_DIR = "$env:GITHUB_WORKSPACE\build"
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          $env:SUNSHINE_SOURCE_ASSETS_DIR="$env:GITHUB_WORKSPACE\src_assets"
+          $env:SUNSHINE_ASSETS_DIR="$env:GITHUB_WORKSPACE\build"
           npm run build
           exit $LASTEXITCODE
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~\.cargo\registry
-            ~\.cargo\git
-            src_assets/common/sunshine-control-panel/src-tauri/target
-          key: console-gui-${{ runner.os }}-${{ hashFiles('src_assets/common/sunshine-control-panel/src-tauri/Cargo.lock') }}
-      - name: Build local GUI without embedded font resources
-        shell: pwsh
-        working-directory: src_assets/common/sunshine-control-panel
-        run: |
-          npm ci
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          npm run test:renderer
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          npm run build:native-plugins
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          npm run build:renderer
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo build --manifest-path src-tauri/Cargo.toml --release --locked
-          exit $LASTEXITCODE
-      - name: Build optional DualSense sidecar and manifest
+      - name: Build optional sidecar and required package manifest
         shell: pwsh
         run: |
           ./scripts/build-ds5-sidecar.ps1 -ReleaseTag 'v2026.911.85650.杂鱼'
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-      - uses: actions/cache@v4
+          exit $LASTEXITCODE
+      - uses: actions/cache/restore@v4
+        id: core_cache
         with:
           path: .ccache
-          key: console-core-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: console-core-${{ runner.os }}-
-      - name: Verify dependency checkouts immediately before CMake
+          key: console-core-v2-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            console-core-v2-${{ runner.os }}-
+            console-core-${{ runner.os }}-
+      - name: Verify pinned dependencies before configuration
         shell: pwsh
         run: python scripts/console-build-preflight.py
-      - name: Configure main program with HDR enabled
+      - name: Configure main program before the slow GUI build
         shell: msys2 {0}
         env:
-          BUILD_VERSION: v2026.912.2-console-test
-          BRANCH: console-helper-test
+          BUILD_VERSION: v2026.912.3-console-test
+          BRANCH: master
           COMMIT: ${{ needs.integrate.outputs.source_sha }}
-          CCACHE_DIR: ${{ github.workspace }}\.ccache
         run: |
           set -euo pipefail
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -175,15 +156,14 @@ jobs:
             -DSUNSHINE_ASSETS_DIR=assets -DDRIVER_DEPS_REQUIRED=ON \
             -DSUNSHINE_RTX_HDR=ON -DSUNSHINE_PINNED_RELEASE_ADAPTER_DIR="$(pwd -W)/build/pinned-rtx" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DSUNSHINE_PREFER_LOCAL_GUI=ON \
+            -DSUNSHINE_PREFER_LOCAL_GUI=ON -DSUNSHINE_DEFER_LOCAL_GUI=ON \
             -DSUNSHINE_PUBLISHER_NAME='Console Helper Test Build' \
             -DSUNSHINE_PUBLISHER_WEBSITE='https://github.com/rui12366B/foundation-sunshine' \
             -DSUNSHINE_PUBLISHER_ISSUE_URL='https://github.com/rui12366B/foundation-sunshine/issues' 2>&1 | tee build/configure-main.log
           grep -q '^SUNSHINE_RTX_HDR_AVAILABLE:INTERNAL=TRUE' build/CMakeCache.txt
       - name: Compile complete Windows program
+        id: core_build
         shell: msys2 {0}
-        env:
-          CCACHE_DIR: ${{ github.workspace }}\.ccache
         run: |
           set -euo pipefail
           cmake --build build --parallel 2 2>&1 | tee build/main-build.log
@@ -193,7 +173,33 @@ jobs:
         run: |
           set -euo pipefail
           ctest --test-dir build --output-on-failure 2>&1 | tee build/native-tests.log
-      - name: Stage and audit required binaries
+      - uses: actions/cache/restore@v4
+        id: gui_cache
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            src_assets/common/sunshine-control-panel/src-tauri/target
+          key: console-gui-v2-${{ runner.os }}-${{ hashFiles('src_assets/common/sunshine-control-panel/src-tauri/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            console-gui-v2-${{ runner.os }}-${{ hashFiles('src_assets/common/sunshine-control-panel/src-tauri/Cargo.lock') }}-
+            console-gui-${{ runner.os }}-
+      - name: Build complete local GUI without font binaries
+        id: gui_build
+        shell: pwsh
+        working-directory: src_assets/common/sunshine-control-panel
+        run: |
+          npm ci
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          npm run test:renderer
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          npm run build:native-plugins
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          npm run build:renderer
+          if($LASTEXITCODE){exit $LASTEXITCODE}
+          cargo build --manifest-path src-tauri/Cargo.toml --release --locked
+          exit $LASTEXITCODE
+      - name: Stage and audit every required component
         shell: msys2 {0}
         run: |
           set -euo pipefail
@@ -201,13 +207,14 @@ jobs:
           test -f build/inno_staging/sunshine.exe
           test -f build/inno_staging/tools/foundation_display_helper.exe
           test -f build/inno_staging/assets/gui/sunshine-gui.exe
+          test -f build/inno_staging/assets/gui/alkaidlab-plugin-stylus.dll
           test -f build/inno_staging/tools/hdr_enhanced/nvidia_rtx_video/foundation_rtx_video_adapter.dll
           python - <<'PY'
           import pathlib
           root=pathlib.Path('build/inno_staging')
           extensions={'.ttf','.otf','.woff','.woff2','.ttc','.otc','.eot','.dfont','.pfa','.pfb','.fon','.fnt','.bdf','.pcf'}
           forbidden=[str(p) for p in root.rglob('*') if p.suffix.lower() in extensions or p.name=='nvngx_truehdr.dll']
-          if forbidden: raise SystemExit('Unwanted resources in package: '+repr(forbidden))
+          if forbidden:raise SystemExit('Unwanted package resources: '+repr(forbidden))
           PY
       - name: Build installer and portable package
         shell: msys2 {0}
@@ -228,7 +235,20 @@ jobs:
           path: artifacts
           if-no-files-found: error
           retention-days: 7
-      - name: Upload diagnostics even when compilation fails
+      - uses: actions/cache/save@v4
+        if: always() && steps.core_build.outcome != 'skipped' && steps.core_build.outcome != ''
+        with:
+          path: .ccache
+          key: ${{ steps.core_cache.outputs.cache-primary-key }}
+      - uses: actions/cache/save@v4
+        if: always() && steps.gui_build.outcome != 'skipped' && steps.gui_build.outcome != ''
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            src_assets/common/sunshine-control-panel/src-tauri/target
+          key: ${{ steps.gui_cache.outputs.cache-primary-key }}
+      - name: Upload diagnostics even on failure
         if: always()
         uses: actions/upload-artifact@v4
         with:

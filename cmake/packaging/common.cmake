@@ -1,9 +1,10 @@
 # common packaging
-
-# common cpack options
 set(CPACK_PACKAGE_NAME ${CMAKE_PROJECT_NAME})
 set(CPACK_PACKAGE_VENDOR "qiin2333")
-string(REGEX REPLACE "^v" "" CPACK_PACKAGE_VERSION ${PROJECT_VERSION})  # remove the v prefix if it exists
+if(SUNSHINE_PUBLISHER_NAME)
+    set(CPACK_PACKAGE_VENDOR "${SUNSHINE_PUBLISHER_NAME}")
+endif()
+string(REGEX REPLACE "^v" "" CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 set(CPACK_PACKAGE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/cpack_artifacts)
 set(CPACK_PACKAGE_CONTACT "https://alkaidlab.com")
 set(CPACK_PACKAGE_DESCRIPTION ${CMAKE_PROJECT_DESCRIPTION})
@@ -12,41 +13,29 @@ set(CPACK_RESOURCE_FILE_LICENSE ${PROJECT_SOURCE_DIR}/LICENSE)
 set(CPACK_PACKAGE_ICON ${PROJECT_SOURCE_DIR}/sunshine.png)
 set(CPACK_PACKAGE_FILE_NAME "${CMAKE_PROJECT_NAME}")
 set(CPACK_STRIP_FILES YES)
-
-# install common assets
 install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/common/assets/"
-        DESTINATION "${SUNSHINE_ASSETS_DIR}"
-        PATTERN "web" EXCLUDE)
-
-# install ABR prompt template
-install(FILES "${PROJECT_SOURCE_DIR}/src/assets/abr_prompt.md"
-        DESTINATION "${SUNSHINE_ASSETS_DIR}")
+        DESTINATION "${SUNSHINE_ASSETS_DIR}" PATTERN "web" EXCLUDE)
+install(FILES "${PROJECT_SOURCE_DIR}/src/assets/abr_prompt.md" DESTINATION "${SUNSHINE_ASSETS_DIR}")
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/assets")
-configure_file("${PROJECT_SOURCE_DIR}/src/assets/abr_prompt.md"
-               "${CMAKE_CURRENT_BINARY_DIR}/assets/abr_prompt.md"
-               COPYONLY)
-# copy assets to build directory, for running without install
-file(GLOB_RECURSE ALL_ASSETS
-        RELATIVE "${SUNSHINE_SOURCE_ASSETS_DIR}/common/assets/" "${SUNSHINE_SOURCE_ASSETS_DIR}/common/assets/*")
-list(FILTER ALL_ASSETS EXCLUDE REGEX "^web/.*$")  # Filter out the web directory
-foreach(asset ${ALL_ASSETS})  # Copy assets to build directory, excluding the web directory
-    file(COPY "${SUNSHINE_SOURCE_ASSETS_DIR}/common/assets/${asset}"
-            DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/assets")
+configure_file("${PROJECT_SOURCE_DIR}/src/assets/abr_prompt.md" "${CMAKE_CURRENT_BINARY_DIR}/assets/abr_prompt.md" COPYONLY)
+file(GLOB_RECURSE ALL_ASSETS RELATIVE "${SUNSHINE_SOURCE_ASSETS_DIR}/common/assets/" "${SUNSHINE_SOURCE_ASSETS_DIR}/common/assets/*")
+list(FILTER ALL_ASSETS EXCLUDE REGEX "^web/.*$")
+foreach(asset ${ALL_ASSETS})
+    file(COPY "${SUNSHINE_SOURCE_ASSETS_DIR}/common/assets/${asset}" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/assets")
 endforeach()
-
-# install built vite assets
-install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/assets/web"
-        DESTINATION "${SUNSHINE_ASSETS_DIR}")
-
-# install sunshine control panel (Tauri GUI) — from pre-built download
+install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/assets/web" DESTINATION "${SUNSHINE_ASSETS_DIR}")
 if(WIN32)
     option(SUNSHINE_PREFER_LOCAL_GUI "Prefer a locally-built Tauri GUI over the downloaded GUI binary" ON)
-
+    option(SUNSHINE_DEFER_LOCAL_GUI "Permit the core to build first; require the complete local GUI at install/package time" OFF)
     set(_local_gui_dir "")
-    if(SUNSHINE_PREFER_LOCAL_GUI)
-        set(TAURI_TARGET_DIR "${SUNSHINE_SOURCE_ASSETS_DIR}/common/sunshine-control-panel/src-tauri/target")
-        set(_candidate_gui_dirs
-                "${TAURI_TARGET_DIR}/release"
+    set(TAURI_TARGET_DIR "${SUNSHINE_SOURCE_ASSETS_DIR}/common/sunshine-control-panel/src-tauri/target")
+    if(SUNSHINE_DEFER_LOCAL_GUI)
+        if(NOT SUNSHINE_PREFER_LOCAL_GUI)
+            message(FATAL_ERROR "Deferred GUI builds require SUNSHINE_PREFER_LOCAL_GUI=ON")
+        endif()
+        set(_local_gui_dir "${TAURI_TARGET_DIR}/release")
+    elseif(SUNSHINE_PREFER_LOCAL_GUI)
+        set(_candidate_gui_dirs "${TAURI_TARGET_DIR}/release"
                 "${TAURI_TARGET_DIR}/x86_64-pc-windows-gnu/release"
                 "${TAURI_TARGET_DIR}/x86_64-pc-windows-msvc/release")
         set(_local_gui_timestamp "")
@@ -66,50 +55,43 @@ if(WIN32)
             endif()
         endforeach()
     endif()
-
     if(_local_gui_dir)
-        set(GUI_DIR "${_local_gui_dir}")
         set(GUI_DIR "${_local_gui_dir}" CACHE PATH "GUI binary directory" FORCE)
-        message(STATUS "Using local Sunshine GUI binary at ${GUI_DIR}")
+        message(STATUS "Local Sunshine GUI: ${GUI_DIR}; deferred=${SUNSHINE_DEFER_LOCAL_GUI}")
     else()
         include(${CMAKE_MODULE_PATH}/packaging/FetchGUI.cmake)
     endif()
-
-    if(EXISTS "${GUI_DIR}/sunshine-gui.exe" AND
-       EXISTS "${GUI_DIR}/alkaidlab-plugin-stylus.dll")
-        install(PROGRAMS "${GUI_DIR}/sunshine-gui.exe"
-            DESTINATION "${SUNSHINE_ASSETS_DIR}/gui"
-            COMPONENT gui)
-        install(FILES "${GUI_DIR}/alkaidlab-plugin-stylus.dll"
-            DESTINATION "${SUNSHINE_ASSETS_DIR}/gui"
-            COMPONENT gui)
-        # Tauri may generate this file after CMake configure time. Register an
-        # optional install rule now so clean local builds can still include it.
-        install(FILES "${GUI_DIR}/WebView2Loader.dll"
-            DESTINATION "${SUNSHINE_ASSETS_DIR}/gui"
-            COMPONENT gui
-            OPTIONAL)
+    if(SUNSHINE_DEFER_LOCAL_GUI OR (EXISTS "${GUI_DIR}/sunshine-gui.exe" AND EXISTS "${GUI_DIR}/alkaidlab-plugin-stylus.dll"))
+        # Deferral is not optional packaging: fail before creating an incomplete
+        # installer. No placeholder executables or downloaded GUI substitutions.
+        install(CODE "
+            foreach(_gui_file sunshine-gui.exe alkaidlab-plugin-stylus.dll)
+                if(NOT EXISTS \"${GUI_DIR}/\${_gui_file}\")
+                    message(FATAL_ERROR \"The required local GUI component is missing: \${_gui_file}\")
+                endif()
+                file(SIZE \"${GUI_DIR}/\${_gui_file}\" _gui_size)
+                if(_gui_size EQUAL 0)
+                    message(FATAL_ERROR \"The required GUI component is empty: \${_gui_file}\")
+                endif()
+            endforeach()" COMPONENT gui)
+        install(PROGRAMS "${GUI_DIR}/sunshine-gui.exe" DESTINATION "${SUNSHINE_ASSETS_DIR}/gui" COMPONENT gui)
+        install(FILES "${GUI_DIR}/alkaidlab-plugin-stylus.dll" DESTINATION "${SUNSHINE_ASSETS_DIR}/gui" COMPONENT gui)
+        install(FILES "${GUI_DIR}/WebView2Loader.dll" DESTINATION "${SUNSHINE_ASSETS_DIR}/gui" COMPONENT gui OPTIONAL)
     else()
         if(SUNSHINE_ENABLE_TRAY AND NOT SUNSHINE_ENABLE_LEGACY_TRAY)
-            message(FATAL_ERROR
-                "The complete Sunshine GUI bundle is required by the Windows GUI tray build. "
-                "Build the local GUI or configure an explicit GUI release before packaging.")
+            message(FATAL_ERROR "The complete Sunshine GUI bundle is required by the Windows GUI tray build")
         endif()
-        message(WARNING "Sunshine GUI binary is unavailable; continuing only because the GUI tray is disabled")
+        message(WARNING "GUI unavailable; continuing only because the GUI tray is disabled")
     endif()
 endif()
-
-# platform specific packaging
 if(WIN32)
     include(${CMAKE_MODULE_PATH}/packaging/windows.cmake)
 elseif(UNIX)
     include(${CMAKE_MODULE_PATH}/packaging/unix.cmake)
-
     if(APPLE)
         include(${CMAKE_MODULE_PATH}/packaging/macos.cmake)
     else()
         include(${CMAKE_MODULE_PATH}/packaging/linux.cmake)
     endif()
 endif()
-
 include(CPack)
