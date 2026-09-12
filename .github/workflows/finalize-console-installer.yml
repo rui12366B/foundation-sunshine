@@ -1,0 +1,180 @@
+name: Verify and finalize console helper installer
+on:
+  workflow_dispatch:
+    inputs:
+      build_run:
+        description: Successful Console helper Windows test installer run ID
+        required: true
+        type: string
+  workflow_run:
+    workflows: ['Console helper Windows test installer']
+    types: [completed]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  finalize:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: foundation-console-helper-test-installer
+          run-id: ${{ inputs.build_run || github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: incoming
+      - name: Verify and stage the compiled package and matching optional runtime manifest
+        shell: python
+        env:
+          BUILD_RUN: ${{ inputs.build_run || github.event.workflow_run.id }}
+        run: |
+          import hashlib,json,pathlib,re,struct,urllib.request,zipfile
+          root=pathlib.Path.cwd();incoming=root/'incoming';out=root/'final';out.mkdir()
+          hashes={}
+          for line in (incoming/'SHA256SUMS.txt').read_text().splitlines():
+              expected,name=line.split(maxsplit=1);name=pathlib.PurePosixPath(name.lstrip('*')).name
+              path=incoming/name
+              with path.open('rb') as f: actual=hashlib.file_digest(f,'sha256').hexdigest()
+              assert actual==expected,(name,actual,expected)
+              hashes[name]=actual
+          archive=incoming/'Foundation-ConsoleHelper-Test-Portable-x64.zip'
+          assert archive.name in hashes
+          staging=root/'staging';staging.mkdir()
+          with zipfile.ZipFile(archive) as z:
+              for item in z.infolist():
+                  rel=pathlib.PurePosixPath(item.filename.replace('\\','/'))
+                  assert not rel.is_absolute() and '..' not in rel.parts and ':' not in str(rel),item.filename
+              z.extractall(staging)
+          mains=[p for p in staging.rglob('*') if p.is_file() and p.name.lower()=='sunshine.exe']
+          assert len(mains)==1,mains
+          payload=mains[0].parent
+          required=['sunshine.exe','tools/foundation_display_helper.exe','tools/sunshinesvc.exe','assets/gui/sunshine-gui.exe',
+                    'assets/gui/stylus-input-plugin.dll','tools/hdr_enhanced/nvidia_rtx_video/foundation_rtx_video_adapter.dll']
+          binaries={}
+          for name in required:
+              p=payload/name; data=p.read_bytes();assert data[:2]==b'MZ',name
+              offset=struct.unpack_from('<I',data,0x3c)[0]
+              assert data[offset:offset+4]==b'PE\0\0',name
+              machine=struct.unpack_from('<H',data,offset+4)[0]
+              assert machine==0x8664,(name,machine)
+              binaries[name]=hashlib.sha256(data).hexdigest()
+          extensions={'.ttf','.otf','.woff','.woff2','.ttc','.otc','.eot','.dfont','.pfa','.pfb','.fon','.fnt','.bdf','.pcf'}
+          assert not [p for p in payload.rglob('*') if p.suffix.lower() in extensions]
+          assert not list(payload.rglob('nvngx_truehdr.dll'))
+          # The host sidecar implementation was not changed. The manifest must
+          # describe the downloadable official ZIP, not a differently rebuilt ZIP.
+          base='https://github.com/AlkaidLab/foundation-sunshine/releases/download/v2026.911.85650.%E6%9D%82%E9%B1%BC/'
+          assets={
+              'Sunshine.Ds5Sidecar.manifest.json':'f7393bf761169cbc34aab50f17952ebbf04d96b40d8eb34e3701fe50e78725ed',
+              'Sunshine.Ds5Sidecar.x64.zip':'8ed32d2d135cc21c887dcc9b19221830cd4790b8167e165c6b01f4d41ff65423'}
+          for name,sha in assets.items():
+              urllib.request.urlretrieve(base+name,out/name)
+              with (out/name).open('rb') as f: actual=hashlib.file_digest(f,'sha256').hexdigest()
+              assert actual==sha,(name,actual)
+          manifest=json.loads((out/'Sunshine.Ds5Sidecar.manifest.json').read_text(encoding='utf-8-sig'))
+          assert manifest['sha256']==assets['Sunshine.Ds5Sidecar.x64.zip']
+          assert manifest['size']==(out/'Sunshine.Ds5Sidecar.x64.zip').stat().st_size
+          assert manifest['download_url']==base+'Sunshine.Ds5Sidecar.x64.zip'
+          assert manifest['protocol']==1 and manifest['component_version']=='1.2.0'
+          (payload/'tools/ds5-sidecar-package.json').write_bytes((out/'Sunshine.Ds5Sidecar.manifest.json').read_bytes())
+          # Use the unchanged upstream install/service/driver logic with the new
+          # helper already included. Only identity and file paths are configured.
+          template=(root/'cmake/packaging/sunshine.iss.in').read_text(encoding='utf-8')
+          values={'CMAKE_PROJECT_NAME':'Sunshine','CPACK_PACKAGE_VERSION':'2026.912.2-console-test',
+            'CPACK_PACKAGE_VENDOR':'Console Helper Test Build (Foundation fork)',
+            'CMAKE_PROJECT_HOMEPAGE_URL':'https://github.com/rui12366B/foundation-sunshine',
+            'INNO_STAGING_DIR':str(payload),'CMAKE_SOURCE_DIR':str(root),'CPACK_PACKAGE_DIRECTORY':str(out)}
+          for key,value in values.items(): template=template.replace('@'+key+'@',value)
+          assert not re.findall(r'@[A-Za-z_][A-Za-z_0-9]*@',template)
+          assert 'foundation_display_helper.exe' in template
+          (root/'final-installer.iss').write_text(template,encoding='utf-8-sig')
+          (root/'payload-path.txt').write_text(str(payload))
+          with zipfile.ZipFile(out/'Foundation-ConsoleHelper-Test-Portable-x64.zip','w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+              for path in sorted(payload.rglob('*')):
+                  if path.is_file(): z.write(path,str(path.relative_to(payload)))
+          import os
+          report={'build_run':os.environ['BUILD_RUN'],'packaging_source':os.environ['GITHUB_SHA'],
+              'core_binaries_sha256':binaries,'original_build_artifacts':hashes,
+              'sidecar':'Unchanged, verified exact-release runtime and matching public download manifest',
+              'windows_installer_smoke_test':'pending','rdp_zako_gpu_end_to_end':'not tested on target hardware'}
+          (out/'verification.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
+      - name: Install Inno Setup compiler
+        shell: pwsh
+        run: |
+          $exe="${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if(!(Test-Path $exe)) {
+            $installer="$env:RUNNER_TEMP\innosetup.exe"
+            Invoke-WebRequest 'https://jrsoftware.org/download.php/is.exe' -OutFile $installer
+            $p=Start-Process $installer -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-' -Wait -PassThru
+            if($p.ExitCode){exit $p.ExitCode}
+          }
+          if(!(Test-Path $exe)){throw 'Missing Inno Setup 6'}
+          & $exe final-installer.iss *> final/packaging.log
+          if($LASTEXITCODE){Get-Content final/packaging.log -Tail 80;exit $LASTEXITCODE}
+          Move-Item final/Sunshine.exe final/Foundation-ConsoleHelper-Test-Windows-x64.exe
+      - name: Install on disposable Windows runner and verify installed binaries and service
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          if(Get-Service SunshineService -ErrorAction SilentlyContinue){throw 'Refusing to touch a preexisting Sunshine service'}
+          $dir='C:\FoundationConsoleSmoke'
+          if(Test-Path $dir){throw 'Smoke install destination already exists'}
+          $exe=Join-Path $env:GITHUB_WORKSPACE 'final\Foundation-ConsoleHelper-Test-Windows-x64.exe'
+          $log=Join-Path $env:GITHUB_WORKSPACE 'final\install-smoke.log'
+          # No VDD, gamepad, vmouse, firewall, or autostart component is selected.
+          # The original installer still registers/starts its service on this
+          # disposable worker. It never connects to the user's machine.
+          $args=@('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',('/DIR="'+$dir+'"'),
+                  '/TYPE=custom','/COMPONENTS="application,assets,gui,tools"','/TASKS=""',('/LOG="'+$log+'"'))
+          $p=Start-Process $exe -ArgumentList $args -PassThru
+          if(!$p.WaitForExit(180000)){Stop-Process $p.Id -Force;throw 'Installer smoke test timed out'}
+          if($p.ExitCode -ne 0){Get-Content $log -Tail 100;throw "Installer exit code $($p.ExitCode)"}
+          try {
+            $service=Get-Service SunshineService -ErrorAction Stop
+            $report=Get-Content final/verification.json -Raw | ConvertFrom-Json
+            foreach($item in $report.core_binaries_sha256.PSObject.Properties){
+              $installed=Join-Path $dir $item.Name
+              if((Get-FileHash $installed -Algorithm SHA256).Hash.ToLowerInvariant() -ne $item.Value){throw "Installed file hash mismatch $($item.Name)"}
+            }
+            & "$dir\sunshine.exe" --version *> final/installed-version.txt
+            if($LASTEXITCODE){throw 'Installed main executable cannot start cleanly with --version'}
+            $manifest=Get-Content "$dir\tools\ds5-sidecar-package.json" -Raw | ConvertFrom-Json
+            if($manifest.sha256 -ne '8ed32d2d135cc21c887dcc9b19221830cd4790b8167e165c6b01f4d41ff65423'){throw 'Installed optional component manifest is incorrect'}
+            $report.windows_installer_smoke_test='passed: installer exit 0, service registered, core file hashes correct, main --version exit 0; no optional drivers installed'
+            $report | ConvertTo-Json -Depth 6 | Set-Content final/verification.json -Encoding utf8
+          } finally {
+            Stop-Service SunshineService -Force -ErrorAction SilentlyContinue
+            # The disposable runner is deleted by GitHub after this job; do not
+            # call the all-component uninstaller just to remove test files.
+          }
+      - name: Hash the final tested deliverables
+        shell: python
+        run: |
+          import hashlib,pathlib
+          root=pathlib.Path('final');lines=[]
+          for p in sorted(root.iterdir()):
+              if p.suffix in ('.exe','.zip'):
+                  with p.open('rb') as f:sha=hashlib.file_digest(f,'sha256').hexdigest()
+                  lines.append(sha+'  '+p.name)
+          (root/'SHA256SUMS.txt').write_text('\n'.join(lines)+'\n')
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: foundation-console-helper-verified-installer
+          path: final
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: foundation-console-helper-finalize-failure
+          path: |
+            final/*.log
+            final/*.json
+            final/*.txt
+          retention-days: 7
