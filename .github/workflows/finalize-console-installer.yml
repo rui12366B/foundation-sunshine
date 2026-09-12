@@ -33,7 +33,7 @@ jobs:
         env:
           BUILD_RUN: ${{ inputs.build_run || github.event.workflow_run.id }}
         run: |
-          import hashlib,json,pathlib,re,struct,urllib.request,zipfile,os
+          import hashlib,json,pathlib,re,struct,subprocess,urllib.request,zipfile,os
           root=pathlib.Path.cwd();incoming=root/'incoming';out=root/'final';out.mkdir()
           hashes={}
           for line in (incoming/'SHA256SUMS.txt').read_text().splitlines():
@@ -65,6 +65,13 @@ jobs:
           extensions={'.ttf','.otf','.woff','.woff2','.ttc','.otc','.eot','.dfont','.pfa','.pfb','.fon','.fnt','.bdf','.pcf'}
           assert not [p for p in payload.rglob('*') if p.suffix.lower() in extensions]
           assert not list(payload.rglob('nvngx_truehdr.dll'))
+          version_result=subprocess.run([str(payload/'sunshine.exe'),'--version'],cwd=payload,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=30)
+          version_output=version_result.stdout+version_result.stderr
+          (out/'portable-version.txt').write_text(version_output,encoding='utf-8')
+          assert version_result.returncode==0,version_output
+          match=re.search(r'(?<![0-9])v?(2026\.\d+\.\d+-console-test)(?![A-Za-z0-9.-])',version_output)
+          assert match,'Expected test-build version missing: '+version_output
+          version=match.group(1)
           # Retain the existing optional runtime. Its published download URL must
           # match the verified ZIP hash, rather than a newly rebuilt ZIP's hash.
           base='https://github.com/AlkaidLab/foundation-sunshine/releases/download/v2026.911.85650.%E6%9D%82%E9%B1%BC/'
@@ -82,7 +89,7 @@ jobs:
           assert manifest['protocol']==1 and manifest['component_version']=='1.2.0'
           (payload/'tools/ds5-sidecar-package.json').write_bytes((out/'Sunshine.Ds5Sidecar.manifest.json').read_bytes())
           template=(root/'cmake/packaging/sunshine.iss.in').read_text(encoding='utf-8')
-          values={'CMAKE_PROJECT_NAME':'Sunshine','CPACK_PACKAGE_VERSION':'2026.912.2-console-test',
+          values={'CMAKE_PROJECT_NAME':'Sunshine','CPACK_PACKAGE_VERSION':version,
             'CPACK_PACKAGE_VENDOR':'Console Helper Test Build (Foundation fork)',
             'CMAKE_PROJECT_HOMEPAGE_URL':'https://github.com/rui12366B/foundation-sunshine',
             'INNO_STAGING_DIR':str(payload),'CMAKE_SOURCE_DIR':str(root),'CPACK_PACKAGE_DIRECTORY':str(out)}
@@ -93,7 +100,7 @@ jobs:
           with zipfile.ZipFile(out/'Foundation-ConsoleHelper-Test-Portable-x64.zip','w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
               for path in sorted(payload.rglob('*')):
                   if path.is_file():z.write(path,str(path.relative_to(payload)))
-          report={'build_run':os.environ['BUILD_RUN'],'packaging_source':os.environ['GITHUB_SHA'],
+          report={'build_run':os.environ['BUILD_RUN'],'packaging_source':os.environ['GITHUB_SHA'],'version':version,
             'core_binaries_sha256':binaries,'original_build_artifacts':hashes,
             'sidecar':'Unchanged exact-release optional runtime with matching verified public manifest',
             'windows_installer_smoke_test':'pending','rdp_zako_gpu_end_to_end':'not tested on target hardware'}
