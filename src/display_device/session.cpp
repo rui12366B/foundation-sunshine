@@ -9,6 +9,7 @@
 #include "parsed_config.h"
 #include "session.h"
 #include "state_retry_timer.h"
+#include "final_primary.h"
 #include "src/platform/windows/display_session_bridge/client.h"
 #include "src/globals.h"
 #include "src/platform/common.h"
@@ -570,19 +571,55 @@ namespace display_device {
       const bool primary_required = parsed_config->device_prep == parsed_config_t::device_prep_e::ensure_primary ||
                                     parsed_config->device_prep == parsed_config_t::device_prep_e::ensure_only_display;
       if (display_session_bridge::enabled() && primary_required && !parsed_config->device_id.empty()) {
-        bool primary_verified = false;
-        for (int attempt = 0; attempt < 3; ++attempt) {
-          if (is_primary_device(parsed_config->device_id)) { primary_verified = true; break; }
-          std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        if (!primary_verified) {
+        // apply_config sets the primary before modes/HDR. Those later operations
+        // can invalidate the origin it just selected. Finish on fresh CCD data;
+        // merely polling three times used to turn this recoverable case into 503.
+        const auto &target = parsed_config->device_id;
+        std::string observed = "not queried";
+        const auto primary = detail::reconcile_primary(
+          [&]() {
+            const auto data = w_utils::query_display_config(w_utils::ACTIVE_ONLY_DEVICES);
+            if (!data) {
+              observed = "console CCD query unavailable";
+              return detail::primary_observation::unavailable;
+            }
+            const auto path = w_utils::get_active_path(target, data->paths);
+            if (!path) {
+              observed = "target missing from active console topology";
+              return detail::primary_observation::unavailable;
+            }
+            const auto mode = w_utils::get_source_mode(w_utils::get_source_index(*path, data->modes), data->modes);
+            if (!mode) {
+              observed = "target has no valid source mode";
+              return detail::primary_observation::unavailable;
+            }
+            observed = "position=" + std::to_string(mode->position.x) + "," + std::to_string(mode->position.y) +
+              " size=" + std::to_string(mode->width) + "x" + std::to_string(mode->height);
+            return w_utils::is_primary(*mode) ? detail::primary_observation::primary : detail::primary_observation::secondary;
+          },
+          [&]() {
+            BOOST_LOG(warning) << "[Display Finalize] Reasserting primary after modes/HDR: target="
+                               << target << "; " << observed;
+            return set_as_primary_device(target);
+          },
+          []() { std::this_thread::sleep_for(std::chrono::milliseconds(100)); });
+        if (!primary) {
+          // Keep failure cleanup: destroying VDD here is the consequence of
+          // rejected launch preparation, not an active-stream lifetime event.
+          BOOST_LOG(error) << "[Display Finalize] DISPLAY_PRIMARY_FAILED: target=" << target
+                           << "; " << observed << "; result=" << static_cast<int>(primary.result)
+                           << "; observations=" << primary.observations << "; corrections=" << primary.corrections
+                           << "; reverting failed launch before capture";
           restore_state_impl(revert_reason_e::config_cleanup);
           return {
             configure_result_t::result_e::primary_display_fail,
-            "The requested display did not become primary after configuration.",
-            "See Display Session Helper logs; no stream was started on a stale secondary display."
+            "The requested display did not remain primary after resolution/HDR configuration.",
+            "See [Display Finalize] for the target position and correction result. No stream was started on a stale secondary display."
           };
         }
+        BOOST_LOG(info) << "[Display Finalize] Primary verified after modes/HDR: target=" << target
+                        << "; " << observed << "; observations=" << primary.observations
+                        << "; corrections=" << primary.corrections;
       }
       timer->setup_timer(nullptr);
       pending_vdd_.reset();

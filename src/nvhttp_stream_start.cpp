@@ -668,6 +668,10 @@ namespace nvhttp::stream_start {
       client_status_message += hint;
     }
 
+    // Record the reason before the launch guard rolls displays back. A client
+    // may show only HTTP 503, while the old host log showed only VDD teardown.
+    BOOST_LOG(error) << "[Stream Startup] status=" << status_code << "; code=" << error_code
+                     << "; source=" << source << "; stage=" << stage << "; " << client_status_message;
     tree.put("root.<xmlattr>.status_code", status_code);
     tree.put("root.<xmlattr>.status_message", client_status_message);
     tree.put("root.sunshine_error_code", error_code);

@@ -547,3 +547,10 @@ if (WIN32)
             CXX_STANDARD 23
             LINK_SEARCH_START_STATIC 1)
 endif ()
+
+# Same final-primary policy used by configure_display, not a replacement for GPU/RDP tests.
+add_executable(display_primary_regression_tests
+        ${CMAKE_SOURCE_DIR}/tests/display_session_bridge/primary_test.cpp)
+target_include_directories(display_primary_regression_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+set_target_properties(display_primary_regression_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME display_primary_regression_tests COMMAND display_primary_regression_tests)
