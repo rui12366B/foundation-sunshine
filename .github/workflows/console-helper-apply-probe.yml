@@ -1,0 +1,156 @@
+name: Console helper unchanged-layout apply test
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: ['.github/workflows/console-helper-apply-probe.yml']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+      - name: Prepare isolated runner probe
+        shell: python
+        run: |
+          from pathlib import Path
+          Path('tests/display_session_bridge/probe_windows.cpp').write_text(r'''
+          #include "src/platform/windows/display_session_bridge/client.h"
+          #include <iostream>
+          #include <string_view>
+          #include <tuple>
+          #include <vector>
+          #include <algorithm>
+          #include <wtsapi32.h>
+          using namespace display_session_bridge;
+          int lock_state() {
+            LPWSTR data=nullptr;DWORD count=0;
+            if(!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE,WTSGetActiveConsoleSessionId(),WTSSessionInfoEx,&data,&count))return -1;
+            int result=-1;
+            if(data && count>=sizeof(WTSINFOEXW) && reinterpret_cast<WTSINFOEXW*>(data)->Level==1)
+              result=static_cast<int>(reinterpret_cast<WTSINFOEXW*>(data)->Data.WTSInfoExLevel1.SessionFlags);
+            if(data)WTSFreeMemory(data);
+            return result;
+          }
+          using key=std::tuple<LONG,DWORD,UINT32,LONG,DWORD,UINT32,LONG,LONG,UINT32,UINT32>;
+          struct snapshot {std::vector<DISPLAYCONFIG_PATH_INFO> paths;std::vector<DISPLAYCONFIG_MODE_INFO> modes;};
+          LONG read(snapshot &s) {
+            constexpr UINT32 flags=QDC_ONLY_ACTIVE_PATHS|QDC_VIRTUAL_MODE_AWARE;
+            UINT32 n=0,m=0;LONG error=get_buffer_sizes(flags,&n,&m);
+            if(error)return error;
+            if(!n)return ERROR_NOT_READY;
+            s.paths.resize(n);s.modes.resize(m);
+            error=query_config(flags,&n,s.paths.data(),&m,s.modes.data(),nullptr);
+            if(!error){s.paths.resize(n);s.modes.resize(m);}
+            return error;
+          }
+          std::vector<key> layout(const snapshot &s) {
+            std::vector<key> out;
+            for(const auto &p:s.paths) {
+              LONG x=0,y=0;UINT32 w=0,h=0;
+              for(const auto &m:s.modes)if(m.infoType==DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE && m.id==p.sourceInfo.id &&
+                m.adapterId.LowPart==p.sourceInfo.adapterId.LowPart && m.adapterId.HighPart==p.sourceInfo.adapterId.HighPart) {
+                x=m.sourceMode.position.x;y=m.sourceMode.position.y;w=m.sourceMode.width;h=m.sourceMode.height;break;
+              }
+              out.emplace_back(p.sourceInfo.adapterId.HighPart,p.sourceInfo.adapterId.LowPart,p.sourceInfo.id,
+                p.targetInfo.adapterId.HighPart,p.targetInfo.adapterId.LowPart,p.targetInfo.id,x,y,w,h);
+            }
+            std::sort(out.begin(),out.end());return out;
+          }
+          int main(int argc,char**argv) {
+            const std::string_view mode=argc==2?argv[1]:"";
+            if(mode=="--lock-isolated-runner") {
+              if(process_is_system())return 2;
+              if(lock_state()!=WTS_SESSIONSTATE_LOCK && !LockWorkStation())return 3;
+              for(int i=0;i<100 && lock_state()!=WTS_SESSIONSTATE_LOCK;++i)Sleep(100);
+              std::cout<<"lock="<<lock_state()<<'\n';return lock_state()==WTS_SESSIONSTATE_LOCK?0:4;
+            }
+            if(mode!="--normal" && mode!="--locked")return 2;
+            set_log_callback([](const std::string&s){std::cout<<s<<'\n';});set_enabled(true);
+            std::cout<<"adapter="<<(enabled()?"console-helper":"native")<<" lock="<<lock_state()<<'\n';
+            if(!enabled())return 3;
+            if(mode=="--locked" && lock_state()!=WTS_SESSIONSTATE_LOCK)return 4;
+            transaction_scope transaction;
+            snapshot before,after;LONG error=read(before);
+            if(error){std::cout<<"initial-query="<<error<<'\n';shutdown();return 5;}
+            // Apply precisely the currently active layout, on this disposable CI machine only.
+            // No new modes, no disabled screens, no saved database changes, no passwords/unlock.
+            error=set_config(static_cast<UINT32>(before.paths.size()),before.paths.data(),
+              static_cast<UINT32>(before.modes.size()),before.modes.data(),
+              SDC_APPLY|SDC_USE_SUPPLIED_DISPLAY_CONFIG|SDC_VIRTUAL_MODE_AWARE);
+            std::cout<<"actual-apply="<<error<<" lock="<<lock_state()<<'\n';
+            if(error){shutdown();return 6;}
+            error=read(after);const bool unchanged=!error && layout(before)==layout(after);
+            std::cout<<"readback="<<error<<" layout-unchanged="<<unchanged<<" lock="<<lock_state()<<'\n';
+            shutdown();
+            if(!unchanged)return 7;
+            return mode=="--locked" && lock_state()!=WTS_SESSIONSTATE_LOCK?8:0;
+          }
+          ''',encoding='utf-8')
+      - name: Compile matched helper and probe
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cmake -S tests/display_session_bridge -B checks -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build checks --parallel 2
+          ctest --test-dir checks --output-on-failure
+      - name: Apply unchanged console layout in both contexts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $env:GITHUB_WORKSPACE 'evidence'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          $probe=Join-Path $env:GITHUB_WORKSPACE 'checks\bridge_probe.exe'
+          $env:PATH='C:\msys64\ucrt64\bin;'+$env:PATH
+          $results=@()
+          foreach($phase in @('normal','locked')) {
+            if($phase -eq 'locked') {
+              & $probe --lock-isolated-runner *> "$root\lock-request.txt"
+              if($LASTEXITCODE) {throw 'The isolated runner was not locked; test not passed'}
+            }
+            $script=Join-Path $root "run-$phase.ps1"
+            $qr=$root.Replace("'","''");$qp=$probe.Replace("'","''")
+            @"
+          `$env:PATH='C:\msys64\ucrt64\bin;'+`$env:PATH
+          & '$qp' --$phase *> '$qr\probe-$phase.txt'
+          [System.IO.File]::WriteAllText('$qr\exit-$phase.txt',[string]`$LASTEXITCODE)
+          "@ | Set-Content $script -Encoding utf8
+            $task='FoundationNoopApply-'+[guid]::NewGuid().ToString('N')
+            try {
+              $a=New-ScheduledTaskAction -Execute powershell.exe -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "'+$script+'"')
+              $p=New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
+              $s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
+              Register-ScheduledTask -TaskName $task -Action $a -Principal $p -Settings $s | Out-Null
+              Start-ScheduledTask $task
+              $deadline=(Get-Date).AddSeconds(65)
+              while(!(Test-Path "$root\exit-$phase.txt") -and (Get-Date) -lt $deadline) {Start-Sleep -Milliseconds 500}
+              if(!(Test-Path "$root\exit-$phase.txt")) {throw 'SYSTEM apply probe timed out'}
+              $code=(Get-Content "$root\exit-$phase.txt" -Raw).Trim()
+              $text=Get-Content "$root\probe-$phase.txt" -Raw
+              Write-Host $text
+              $passed=$code -eq '0' -and $text.Contains('actual-apply=0') -and $text.Contains('layout-unchanged=1')
+              if($phase -eq 'locked') {$passed=$passed -and $text.Contains('context=SYSTEM-locked-console') -and $text.Contains('lock=0')}
+              $results+=@{phase=$phase;exit_code=$code;passed=$passed}
+              @{source_commit=$env:GITHUB_SHA;scope='Actual SDC_APPLY of unchanged layout and readback, normal/locked isolated Windows console. Not Zako creation, RDP takeover or GPU capture.';results=$results} | ConvertTo-Json -Depth 6 | Set-Content "$root\results.json"
+              if(!$passed) {throw "Candidate $phase apply failed"}
+            } finally {
+              Stop-ScheduledTask $task -ErrorAction SilentlyContinue
+              Unregister-ScheduledTask $task -Confirm:$false -ErrorAction SilentlyContinue
+            }
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: console-helper-actual-apply-evidence
+          path: |
+            evidence
+            tests/display_session_bridge/probe_windows.cpp
+            checks/Testing/Temporary/*.log
+          retention-days: 7
