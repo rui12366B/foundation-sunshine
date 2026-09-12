@@ -1,0 +1,35 @@
+{
+  "base_commit": "44e25f3a49e1897d822f20d8fd6ceb0732c02529",
+  "reason": "Post-mode/HDR primary reconciliation; keep normal VDD ownership/rollback",
+  "files": [
+    {
+      "path": "src/display_device/session.cpp",
+      "old_sha256": "53f48d787efa70c16c792a40a3a8af6e38d831cd7f461fc8bcc812f42a6f2c35",
+      "new_sha256": "280e211ae33c6707602c05782f98a9377932f46e6640928e5a118573258388ab",
+      "edits": [
+        [11,11,"#include \"final_primary.h\"\n"],
+        [572,578,"        // apply_config sets the primary before modes/HDR. Those later operations\n        // can invalidate the origin it just selected. Finish on fresh CCD data;\n        // merely polling three times used to turn this recoverable case into 503.\n        const auto &target = parsed_config->device_id;\n        std::string observed = \"not queried\";\n        const auto primary = detail::reconcile_primary(\n          [&]() {\n            const auto data = w_utils::query_display_config(w_utils::ACTIVE_ONLY_DEVICES);\n            if (!data) {\n              observed = \"console CCD query unavailable\";\n              return detail::primary_observation::unavailable;\n            }\n            const auto path = w_utils::get_active_path(target, data->paths);\n            if (!path) {\n              observed = \"target missing from active console topology\";\n              return detail::primary_observation::unavailable;\n            }\n            const auto mode = w_utils::get_source_mode(w_utils::get_source_index(*path, data->modes), data->modes);\n            if (!mode) {\n              observed = \"target has no valid source mode\";\n              return detail::primary_observation::unavailable;\n            }\n            observed = \"position=\" + std::to_string(mode->position.x) + \",\" + std::to_string(mode->position.y) +\n              \" size=\" + std::to_string(mode->width) + \"x\" + std::to_string(mode->height);\n            return w_utils::is_primary(*mode) ? detail::primary_observation::primary : detail::primary_observation::secondary;\n          },\n          [&]() {\n            BOOST_LOG(warning) << \"[Display Finalize] Reasserting primary after modes/HDR: target=\"\n                               << target << \"; \" << observed;\n            return set_as_primary_device(target);\n          },\n          []() { std::this_thread::sleep_for(std::chrono::milliseconds(100)); });\n        if (!primary) {\n          // Keep failure cleanup: destroying VDD here is the consequence of\n          // rejected launch preparation, not an active-stream lifetime event.\n          BOOST_LOG(error) << \"[Display Finalize] DISPLAY_PRIMARY_FAILED: target=\" << target\n                           << \"; \" << observed << \"; result=\" << static_cast<int>(primary.result)\n                           << \"; observations=\" << primary.observations << \"; corrections=\" << primary.corrections\n                           << \"; reverting failed launch before capture\";\n"],
+        [581,583,"            \"The requested display did not remain primary after resolution/HDR configuration.\",\n            \"See [Display Finalize] for the target position and correction result. No stream was started on a stale secondary display.\"\n"],
+        [585,585,"        BOOST_LOG(info) << \"[Display Finalize] Primary verified after modes/HDR: target=\" << target\n                        << \"; \" << observed << \"; observations=\" << primary.observations\n                        << \"; corrections=\" << primary.corrections;\n"]
+      ]
+    },
+    {
+      "path": "src/nvhttp_stream_start.cpp",
+      "old_sha256": "2d336fa5bcac0671f1583702e496203355c94745839f4b132316b4bc7ef40166",
+      "new_sha256": "83efcf4bc5624ad5f729a6af03fc06c274ef4309237a26a184840f54126d824b",
+      "edits": [[670,670,"    // Record the reason before the launch guard rolls displays back. A client\n    // may show only HTTP 503, while the old host log showed only VDD teardown.\n    BOOST_LOG(error) << \"[Stream Startup] status=\" << status_code << \"; code=\" << error_code\n                     << \"; source=\" << source << \"; stage=\" << stage << \"; \" << client_status_message;\n"]]
+    },
+    {
+      "path": "tests/CMakeLists.txt",
+      "old_sha256": "e5107cc73775f6fcae8a3c4d315f43e7d58e174b70ce279415bb75a6be458f6e",
+      "new_sha256": "8091259d8ae3d0d870c5c2960062cf77bda18dc260272646f59f1927d01982d0",
+      "edits": [[549,549,"\n# Same final-primary policy used by configure_display, not a replacement for GPU/RDP tests.\nadd_executable(display_primary_regression_tests\n        ${CMAKE_SOURCE_DIR}/tests/display_session_bridge/primary_test.cpp)\ntarget_include_directories(display_primary_regression_tests PRIVATE \"${CMAKE_SOURCE_DIR}\")\nset_target_properties(display_primary_regression_tests PROPERTIES CXX_STANDARD 23)\nadd_test(NAME display_primary_regression_tests COMMAND display_primary_regression_tests)\n"]]
+    },
+    {
+      "path": "tests/display_session_bridge/CMakeLists.txt",
+      "old_sha256": "266ac5349bbe6c3cc9c521ba3ddceee688e7271a11c32fb0f07eb155515f6224",
+      "new_sha256": "185ad3cbebfb06b9187b505b2f2a8363588a455e56b817fe8c852668f177d2d0",
+      "edits": [[9,10,"foreach(name protocol timer primary)\n"]]
+    }
+  ]
+}
